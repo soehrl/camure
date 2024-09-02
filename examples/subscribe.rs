@@ -8,7 +8,10 @@ fn main() {
         .init();
 
     let mut subscriber = Subscriber::connect("127.0.0.1:12345".parse().unwrap()).unwrap();
+    log::info!("subscriber connected");
+
     let mut subscription = subscriber.subscribe(0).unwrap();
+    log::info!("subscribed to channel 0");
 
     while let Ok(msg) = subscription.recv() {
         let mut msg = msg.read();

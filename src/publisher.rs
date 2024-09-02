@@ -1,12 +1,12 @@
 use std::{
     io::Write,
-    net::{SocketAddr, UdpSocket},
     sync::Arc,
 };
 
 use ahash::HashMap;
 use crossbeam::queue::SegQueue;
 use dashmap::DashSet;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::{
     chunk::{Chunk, ChunkBuffer, ChunkBufferAllocator},
@@ -29,10 +29,10 @@ pub struct Offer {
     sequence: SequenceNumber,
     used_offer_ids: Arc<DashSet<OfferId>>,
     receiver: ChunkReceiver,
-    new_clients: SegQueue<SocketAddr>,
-    clients: HashMap<SocketAddr, Subscriber>,
+    new_clients: SegQueue<SockAddr>,
+    clients: HashMap<SockAddr, Subscriber>,
     buffer_allocator: Arc<ChunkBufferAllocator>,
-    multicast_addr: SocketAddr,
+    multicast_addr: SockAddr,
 }
 
 impl Drop for Offer {
@@ -46,7 +46,7 @@ impl Offer {
         match chunk.validate() {
             Ok(Chunk::JoinChannel(_)) => {
                 log::debug!("received join channel");
-                self.new_clients.push(chunk.addr());
+                self.new_clients.push(chunk.addr().clone());
             }
             Ok(Chunk::Ack(ack)) => {
                 if let Some(subscriber) = self.clients.get_mut(&chunk.addr()) {
@@ -76,11 +76,11 @@ impl Offer {
         !self.clients.is_empty()
     }
 
-    pub fn accept(&mut self) -> Option<SocketAddr> {
+    pub fn accept(&mut self) -> Option<SockAddr> {
         self.process_pending_chunks();
 
         if let Some(client) = self.new_clients.pop() {
-            self.clients.insert(client, Subscriber::default());
+            self.clients.insert(client.clone(), Subscriber::default());
             self.socket
                 .send_chunk_to(
                     ConfirmJoinChannel {
@@ -89,7 +89,7 @@ impl Offer {
                             seq: self.sequence.into(),
                         },
                     },
-                    client,
+                    &client,
                 )
                 .unwrap();
 
@@ -113,7 +113,7 @@ impl Offer {
 
     fn send_chunk_buffer(&mut self, chunk: ChunkBuffer, packet_size: usize) -> Result<(), std::io::Error> {
         log::debug!("sending chunk: {:?}", &chunk[..packet_size]);
-        self.socket.send_chunk_buffer_to(&chunk, packet_size, self.multicast_addr)
+        self.socket.send_chunk_buffer_to(&chunk, packet_size, &self.multicast_addr)
             // TODO: add it to unacknowledged chunks
     }
 
@@ -211,9 +211,11 @@ pub enum CreateOfferError {
 
 impl Publisher {
     pub fn new(config: PublisherConfig) -> Self {
-        let socket = UdpSocket::bind(config.addr).unwrap();
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        socket.bind(&config.addr.into()).unwrap();
+        log::debug!("bound to {}", config.addr);
         let buffer_allocator = Arc::new(ChunkBufferAllocator::new(config.chunk_size.into()));
-        let multicast_addr = SocketAddr::V4(config.multicast_addr);
+        // let multicast_addr = SocketAddr::V4(config.multicast_addr);
 
         let handle_unchannelled = move |socket: &ChunkSocket, chunk: ReceivedChunk| {
             if let Ok(Chunk::Connect(_)) = chunk.validate() {
@@ -239,7 +241,7 @@ impl Publisher {
             )
             .unwrap(),
             buffer_allocator,
-            multicast_addr,
+            multicast_addr: config.multicast_addr.into(),
         }
     }
 
@@ -256,7 +258,7 @@ impl Publisher {
                     new_clients: SegQueue::new(),
                     clients: HashMap::default(),
                     buffer_allocator: self.buffer_allocator.clone(),
-                    multicast_addr: self.multicast_addr,
+                    multicast_addr: self.multicast_addr.into(),
                 });
             }
         }

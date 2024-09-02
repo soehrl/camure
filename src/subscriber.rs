@@ -8,6 +8,7 @@ use std::{
 
 use ahash::HashSet;
 use crossbeam::channel::{RecvError, RecvTimeoutError};
+use socket2::{Domain, Protocol, Socket, Type};
 use zerocopy::FromBytes;
 
 use crate::{
@@ -130,16 +131,20 @@ pub struct Subscriber {
 
 impl Subscriber {
     pub fn connect(addr: SocketAddr) -> Result<Self, ConnectionError> {
-        let control_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        control_socket.connect(addr)?;
+        let control_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        control_socket.connect(&addr.into())?;
 
         let multicast_socket;
         let buffer_allocator;
 
         let mut buffer = [0; CONNECTION_INFO_PACKET_SIZE];
+        let maybe_uninit_buffer = unsafe {
+            std::mem::transmute::<&mut [u8], &mut [std::mem::MaybeUninit<u8>]>(&mut buffer)
+        };
+
         loop {
             if let Ok(1) = control_socket.send(&[0]) {
-                match control_socket.recv(&mut buffer) {
+                match control_socket.recv(maybe_uninit_buffer) {
                     Ok(CONNECTION_INFO_PACKET_SIZE) => {
                         if buffer[0] != kind::CONNECTION_INFO {
                             log::error!("received invalid chunk: {:?}", buffer);
@@ -150,10 +155,16 @@ impl Subscriber {
                             None => unreachable!(),
                         };
                         log::debug!("received connection info: {:?}", conn_info);
-                        multicast_socket = std::net::UdpSocket::bind(SocketAddrV4::new(
-                            conn_info.multicast_addr.into(),
-                            conn_info.multicast_port.into(),
-                        ))?;
+                        multicast_socket =
+                            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+                        multicast_socket.set_reuse_address(true)?;
+                        multicast_socket.bind(
+                            &SocketAddrV4::new(
+                                conn_info.multicast_addr.into(),
+                                conn_info.multicast_port.into(),
+                            )
+                            .into(),
+                        )?;
                         multicast_socket.join_multicast_v4(
                             &conn_info.multicast_addr.into(),
                             &Ipv4Addr::UNSPECIFIED,

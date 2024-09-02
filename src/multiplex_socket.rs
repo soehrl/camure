@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ahash::HashMap;
 use crossbeam::channel::{Receiver, RecvError, Sender};
+use socket2::Socket;
 
 use crate::{
     chunk::ChunkBufferAllocator,
@@ -113,14 +114,14 @@ impl MultiplexSocket {
     }
 
     pub fn new(
-        socket: std::net::UdpSocket,
+        socket: Socket,
         buffer_allocator: Arc<ChunkBufferAllocator>,
     ) -> Result<Self, std::io::Error> {
         Self::with_unchannelled_handler(socket, buffer_allocator, Self::ignore_unchannelled_chunk)
     }
 
     pub fn with_unchannelled_handler<F: Fn(&ChunkSocket, ReceivedChunk) + Send + 'static>(
-        socket: std::net::UdpSocket,
+        socket: Socket,
         buffer_allocator: Arc<ChunkBufferAllocator>,
         process_unchannelled_chunk: F,
     ) -> Result<Self, std::io::Error> {
