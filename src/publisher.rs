@@ -72,7 +72,11 @@ impl Offer {
         self.offer_id
     }
 
-    pub fn accecpt(&mut self) -> Option<SocketAddr> {
+    pub fn has_subscribers(&self) -> bool {
+        !self.clients.is_empty()
+    }
+
+    pub fn accept(&mut self) -> Option<SocketAddr> {
         self.process_pending_chunks();
 
         if let Some(client) = self.new_clients.pop() {
