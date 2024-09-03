@@ -6,7 +6,8 @@ use std::{
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
 
 use crate::protocol::{
-    kind, Ack, ChunkKindData, ConfirmJoinChannel, Connect, ConnectionInfo, JoinChannel, Message,
+    kind, Ack, BarrierReached, BarrierReleased, ChunkKindData, ConfirmJoinChannel, Connect,
+    ConnectionInfo, JoinBarrierGroup, JoinChannel, Message,
 };
 
 #[derive(Debug)]
@@ -17,6 +18,9 @@ pub enum Chunk<'a> {
     ConfirmJoinChannel(&'a ConfirmJoinChannel),
     Ack(&'a Ack),
     Message(&'a Message, &'a [u8]),
+    JoinBarrierGroup(&'a JoinBarrierGroup),
+    BarrierReached(&'a BarrierReached),
+    BarrierReleased(&'a BarrierReleased),
 }
 
 impl Chunk<'_> {
@@ -26,6 +30,9 @@ impl Chunk<'_> {
             Chunk::ConfirmJoinChannel(confirm) => Some(confirm.header.channel_id.into()),
             Chunk::Ack(ack) => Some(ack.header.channel_id.into()),
             Chunk::Message(msg, _) => Some(msg.header.channel_id.into()),
+            Chunk::JoinBarrierGroup(join) => Some(join.0.into()),
+            Chunk::BarrierReached(b) => Some(b.0.channel_id.into()),
+            Chunk::BarrierReleased(b) => Some(b.0.channel_id.into()),
             _ => None,
         }
     }
@@ -92,12 +99,12 @@ pub enum ChunkValidationError {
 }
 
 impl ChunkBuffer {
-    pub fn init<T: ChunkKindData>(&mut self, kind_data: T) {
+    pub fn init<T: ChunkKindData>(&mut self, kind_data: &T) {
         self.bytes[0] = T::kind();
         kind_data.write_to_prefix(&mut self.bytes[1..]);
     }
 
-    pub fn init_with_payload<T: ChunkKindData>(&mut self, kind_data: T, payload: &[u8]) {
+    pub fn init_with_payload<T: ChunkKindData>(&mut self, kind_data: &T, payload: &[u8]) {
         self.bytes[0] = T::kind();
         kind_data.write_to_prefix(&mut self.bytes[1..]);
         let payload_offset = 1 + std::mem::size_of::<T>();
@@ -165,6 +172,15 @@ impl ChunkBuffer {
                 // });
                 Ok(Chunk::Message(data, payload))
             }
+            kind::JOIN_BARRIER_GROUP => Ok(Chunk::JoinBarrierGroup(
+                self.get_kind_data_ref::<JoinBarrierGroup>(packet_size)?,
+            )),
+            kind::BARRIER_REACHED => Ok(Chunk::BarrierReached(
+                self.get_kind_data_ref::<BarrierReached>(packet_size)?,
+            )),
+            kind::BARRIER_RELEASED => Ok(Chunk::BarrierReleased(
+                self.get_kind_data_ref::<BarrierReleased>(packet_size)?,
+            )),
             kind => Err(ChunkValidationError::InvalidChunkKind(kind)),
         }
     }

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use ahash::HashMap;
-use crossbeam::channel::{Receiver, RecvError, Sender};
+use crossbeam::channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use socket2::Socket;
 
 use crate::{
-    chunk::ChunkBufferAllocator,
+    chunk::{Chunk, ChunkBufferAllocator},
     chunk_socket::{ChunkSocket, ReceivedChunk},
     protocol::ChunkKindData,
 };
@@ -36,7 +36,6 @@ impl ChannelConnections {
         while let Some(c) = chunk.take() {
             match self.channels.get(&channel_id) {
                 Some(sender) => {
-                    log::debug!("try sending");
                     if let Err(err) = sender.send(c) {
                         // This sender is disconnected, remove it from the map and try again.
                         self.channels.remove(&channel_id);
@@ -139,13 +138,13 @@ impl MultiplexSocket {
         })
     }
 
-    pub fn send_chunk<T: ChunkKindData>(&self, kind_data: T) -> Result<(), std::io::Error> {
+    pub fn send_chunk<T: ChunkKindData>(&self, kind_data: &T) -> Result<(), std::io::Error> {
         self.socket.send_chunk(kind_data)
     }
 
     pub fn send_chunk_with_payload<T: ChunkKindData>(
         &self,
-        kind_data: T,
+        kind_data: &T,
         payload: &[u8],
     ) -> Result<(), std::io::Error> {
         self.socket.send_chunk_with_payload(kind_data, payload)
@@ -166,5 +165,27 @@ impl MultiplexSocket {
 
     pub fn socket(&self) -> &ChunkSocket {
         &self.socket
+    }
+}
+
+pub fn wait_for_chunk<P: FnMut(Chunk) -> bool>(
+    r: &ChunkReceiver,
+    timeout: std::time::Duration,
+    mut p: P,
+) -> Result<(), RecvTimeoutError> {
+    let start = std::time::Instant::now();
+    let deadline = start + timeout;
+
+    loop {
+        match r.recv_deadline(deadline) {
+            Ok(chunk) => {
+                if let Ok(chunk) = chunk.validate() {
+                    if p(chunk) {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
     }
 }

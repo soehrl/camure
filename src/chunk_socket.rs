@@ -87,7 +87,7 @@ impl ChunkSocket {
         Ok(())
     }
 
-    pub fn send_chunk<T: ChunkKindData>(&self, kind_data: T) -> Result<(), std::io::Error> {
+    pub fn send_chunk<T: ChunkKindData>(&self, kind_data: &T) -> Result<(), std::io::Error> {
         let mut buffer = self.buffer_allocator.allocate();
         buffer.init(kind_data);
         let size = 1 + std::mem::size_of::<T>();
@@ -97,7 +97,7 @@ impl ChunkSocket {
 
     pub fn send_chunk_to<T: ChunkKindData>(
         &self,
-        kind_data: T,
+        kind_data: &T,
         addr: &SockAddr,
     ) -> Result<(), std::io::Error> {
         let mut buffer = self.buffer_allocator.allocate();
@@ -109,7 +109,7 @@ impl ChunkSocket {
 
     pub fn send_chunk_with_payload<T: ChunkKindData>(
         &self,
-        kind_data: T,
+        kind_data: &T,
         payload: &[u8],
     ) -> Result<(), std::io::Error> {
         let mut buffer = self.buffer_allocator.allocate();
@@ -127,7 +127,7 @@ impl ChunkSocket {
 
     pub fn send_chunk_with_payload_to<T: ChunkKindData>(
         &self,
-        kind_data: T,
+        kind_data: &T,
         payload: &[u8],
         addr: &SockAddr,
     ) -> Result<(), std::io::Error> {

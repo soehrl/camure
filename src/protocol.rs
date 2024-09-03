@@ -14,6 +14,11 @@ pub mod kind {
     pub const CONFIRM_JOIN_CHANNEL: ChunkKind = 3;
     pub const ACK: ChunkKind = 4;
     pub const MESSAGE: ChunkKind = 5;
+    // pub const MESSAGE_FRAGMENT: ChunkKind = 6;
+    // pub const FINAL_MESSAGE_FRAGMENT: ChunkKind = 7;
+    pub const JOIN_BARRIER_GROUP: ChunkKind = 8;
+    pub const BARRIER_REACHED: ChunkKind = 9;
+    pub const BARRIER_RELEASED: ChunkKind = 10;
 }
 
 pub const MESSAGE_PAYLOAD_OFFSET: usize = 1 + std::mem::size_of::<Message>();
@@ -82,3 +87,18 @@ pub struct Message {
     pub header: ChannelHeader,
 }
 impl_chunk_data!(Message);
+
+#[derive(Debug, FromBytes, AsBytes, FromZeroes, Unaligned)]
+#[repr(C)]
+pub struct JoinBarrierGroup(pub ChannelId);
+impl_chunk_data!(JoinBarrierGroup);
+
+#[derive(Debug, FromBytes, AsBytes, FromZeroes, Unaligned)]
+#[repr(C)]
+pub struct BarrierReached(pub ChannelHeader);
+impl_chunk_data!(BarrierReached);
+
+#[derive(Debug, FromBytes, AsBytes, FromZeroes, Unaligned)]
+#[repr(C)]
+pub struct BarrierReleased(pub ChannelHeader);
+impl_chunk_data!(BarrierReleased);
