@@ -7,13 +7,13 @@ use std::{
 };
 
 use ahash::HashSet;
-use crossbeam::channel::{RecvError, RecvTimeoutError};
+use crossbeam::channel::RecvTimeoutError;
 use socket2::{Domain, Protocol, Socket, Type};
 use zerocopy::FromBytes;
 
 use crate::{
     chunk::{Chunk, ChunkBufferAllocator},
-    chunk_socket::ReceivedChunk,
+    chunk_socket::{ChunkSocket, ReceivedChunk},
     multiplex_socket::{ChunkReceiver, MultiplexSocket},
     protocol::{kind, Ack, ChannelHeader, ConnectionInfo, JoinChannel, MESSAGE_PAYLOAD_OFFSET},
     OfferId, SequenceNumber,
@@ -83,9 +83,19 @@ pub struct Subscription {
     multicast_receiver: ChunkReceiver,
     buffer_allocator: Arc<ChunkBufferAllocator>,
     sequence: SequenceNumber,
+    control_socket: ChunkSocket,
 
     /// stores the chunks starting from the last received sequence number.
     chunks: VecDeque<Option<ReceivedChunk>>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RecvError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Disconnected")]
+    Recv(#[from] crossbeam::channel::RecvError),
 }
 
 impl Subscription {
@@ -94,17 +104,31 @@ impl Subscription {
             let chunk = self.multicast_receiver.recv()?;
             match chunk.validate() {
                 Ok(Chunk::Message(msg, _)) => {
+                    self.control_socket.send_chunk(Ack {
+                        header: ChannelHeader {
+                            seq: msg.header.seq,
+                            channel_id: msg.header.channel_id,
+                        },
+                    })?;
+
+
                     let seq: u16 = msg.header.seq.into();
-                    if seq != self.sequence + 1 {
-                        panic!(
-                            "unexpected sequence number: expected {}, got {}",
-                            self.sequence + 1,
-                            seq
-                        );
+                    let offset = seq.wrapping_sub(self.sequence.wrapping_add(1));
+                    if offset > u16::MAX / 2 {
+                        // This is most likely an old packet, just ignore it
+                        
                     } else {
-                        log::debug!("received message: {:?}", msg);
-                        self.sequence = seq;
-                        return Ok(Message::SingleChunk(chunk));
+                        if seq != self.sequence.wrapping_add(1) {
+                            panic!(
+                                "unexpected sequence number: expected {}, got {}",
+                                self.sequence.wrapping_add(1),
+                                seq
+                            );
+                        } else {
+                            log::debug!("received message: {:?}", msg);
+                            self.sequence = seq;
+                            return Ok(Message::SingleChunk(chunk));
+                        }
                     }
                 }
                 Ok(chunk) => {
@@ -233,6 +257,7 @@ impl Subscriber {
                                 buffer_allocator: self.buffer_allocator.clone(),
                                 sequence: confirm.header.seq.into(),
                                 chunks: VecDeque::new(),
+                                control_socket: self.control_socket.socket().try_clone()?,
                             });
                         }
                         Ok(c) => {

@@ -1,9 +1,6 @@
-use std::{
-    io::Write,
-    sync::Arc,
-};
+use std::{collections::VecDeque, io::Write, net::SocketAddr, sync::Arc};
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use crossbeam::queue::SegQueue;
 use dashmap::DashSet;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -18,19 +15,37 @@ use crate::{
     OfferId, SequenceNumber,
 };
 
-#[derive(Default)]
-struct Subscriber {
-    latest_ack: Option<SequenceNumber>,
+const RETRANSMIT_MILLIS: u64 = 100;
+
+/// A chunk that has been sent but not yet acknowledged by all subscribers.
+struct UnacknowledgedChunk {
+    sent_time: std::time::Instant,
+    buffer: ChunkBuffer,
+    packet_size: usize,
+    missing_acks: HashSet<SocketAddr>,
+    retransmit_count: usize,
 }
 
 pub struct Offer {
     socket: ChunkSocket,
     offer_id: OfferId,
-    sequence: SequenceNumber,
+
+    // The sequence number of the last message sent.
+    seq_sent: SequenceNumber,
+
+    // The sequence number of the last message acknowledged by all subscribers.
+    seq_ack: SequenceNumber,
+
+    // Chunks, that have been sent but not yet acknowledged by all subscribers.
+    //
+    // The first element corresponds to self.seq_ack + 1 and the last element corresponds to
+    // self.seq_sent.
+    unacknowledged_chunks: VecDeque<Option<UnacknowledgedChunk>>,
+
     used_offer_ids: Arc<DashSet<OfferId>>,
     receiver: ChunkReceiver,
-    new_clients: SegQueue<SockAddr>,
-    clients: HashMap<SockAddr, Subscriber>,
+    new_clients: HashSet<SocketAddr>,
+    clients: HashSet<SocketAddr>,
     buffer_allocator: Arc<ChunkBufferAllocator>,
     multicast_addr: SockAddr,
 }
@@ -42,15 +57,43 @@ impl Drop for Offer {
 }
 
 impl Offer {
+    // fn unacknowledged_chunk_mut(
+    //     &mut self,
+    //     seq: SequenceNumber,
+    // ) -> Option<&mut UnacknowledgedChunk> {
+    //     let index = seq.wrapping_sub(self.seq_ack) as usize - 1;
+    //     self.unacknowledged_chunks
+    //         .get_mut(index)
+    //         .and_then(|c| c.as_mut())
+    // }
+
+    fn unacknowledged_chunks_count(&self) -> usize {
+        self.unacknowledged_chunks
+            .iter()
+            .filter(|c| c.is_some())
+            .count()
+    }
+
     fn process_chunk(&mut self, chunk: ReceivedChunk) {
         match chunk.validate() {
             Ok(Chunk::JoinChannel(_)) => {
-                log::debug!("received join channel");
-                self.new_clients.push(chunk.addr().clone());
+                log::debug!("received join channel {}", self.offer_id);
+                self.new_clients.insert(chunk.addr().as_socket().unwrap());
             }
             Ok(Chunk::Ack(ack)) => {
-                if let Some(subscriber) = self.clients.get_mut(&chunk.addr()) {
-                    subscriber.latest_ack = Some(ack.header.seq.into());
+                let ack_seq: u16 = ack.header.seq.into();
+                let offset = ack_seq.wrapping_sub(self.seq_ack).wrapping_sub(1);
+                log::debug!("received ack from {}", chunk.addr().as_socket().unwrap());
+                log::debug!("received ack: {ack_seq} ({offset}) {}", self.seq_sent);
+                if offset > u16::MAX / 2 {
+                    // this ack is probably from the past
+                } else {
+                    if let Some(c) = self.unacknowledged_chunks.get_mut(offset as usize) {
+                        if let Some(c) = c {
+                            log::debug!("removing ack from {:?}", c.missing_acks);
+                            c.missing_acks.remove(&chunk.addr().as_socket().unwrap());
+                        }
+                    }
                 }
             }
             Ok(chunk) => {
@@ -68,6 +111,81 @@ impl Offer {
         }
     }
 
+    fn wait_for_chunk(&mut self) {
+        if let Ok(chunk) = self.receiver.recv() {
+            self.process_chunk(chunk);
+        }
+    }
+
+    fn wait_for_chunk_timeout(&mut self, timeout: std::time::Duration) {
+        if let Ok(chunk) = self.receiver.recv_timeout(timeout) {
+            self.process_chunk(chunk);
+        }
+    }
+
+    fn process_unacknlowedged_chunks(&mut self) {
+        // Retransmit chunks, check for disconnects, and remove acknowledged chunks
+        let mut clients_to_remove = HashSet::default();
+        for (offset, chunk) in self.unacknowledged_chunks.iter_mut().enumerate() {
+            if let Some(c) = chunk {
+                if c.missing_acks.is_empty() {
+                    chunk.take();
+                    continue;
+                }
+
+                let millis = (1 << c.retransmit_count) * RETRANSMIT_MILLIS;
+                if c.sent_time.elapsed().as_millis() > millis.into() {
+                    if c.retransmit_count < 5 {
+                        log::debug!(
+                            "retransmitting chunk: {}",
+                            self.seq_ack.wrapping_add(offset as u16).wrapping_add(1)
+                        );
+                        self.socket
+                            .send_chunk_buffer_to(&c.buffer, c.packet_size, &self.multicast_addr)
+                            .unwrap();
+
+                        // TODO: should we reset the sent time?
+                        c.sent_time = std::time::Instant::now();
+                        c.retransmit_count += 1;
+                    } else {
+                        log::debug!("time out for chunk {} and subscribers: {:?}", offset, c.missing_acks);
+                        clients_to_remove.extend(c.missing_acks.iter().cloned());
+                    }
+                }
+            }
+        }
+        if !clients_to_remove.is_empty() {
+            log::warn!("clients timed out: {:?}", clients_to_remove);
+            self.clients.retain(|c| !clients_to_remove.contains(&c));
+
+            for chunk in &mut self.unacknowledged_chunks {
+                if let Some(c) = chunk {
+                    c.missing_acks.retain(|a| !clients_to_remove.contains(a));
+                }
+            }
+        }
+
+        // Remove acknowledged chunks from the front
+        while let Some(None) = self.unacknowledged_chunks.front() {
+            log::debug!("removing acknowledged chunk");
+            self.unacknowledged_chunks.pop_front();
+            self.seq_ack = self.seq_ack.wrapping_add(1);
+        }
+    }
+
+    fn process(&mut self) {
+        // Process pending acks etc
+        self.process_pending_chunks();
+
+        // Retransmit chunks
+        self.process_unacknlowedged_chunks();
+    }
+
+    fn process_blocking(&mut self) {
+        self.wait_for_chunk();
+        self.process();
+    }
+
     pub fn id(&self) -> OfferId {
         self.offer_id
     }
@@ -76,33 +194,59 @@ impl Offer {
         !self.clients.is_empty()
     }
 
-    pub fn accept(&mut self) -> Option<SockAddr> {
-        self.process_pending_chunks();
+    pub fn accept(&mut self) -> Option<SocketAddr> {
+        self.process();
 
-        if let Some(client) = self.new_clients.pop() {
-            self.clients.insert(client.clone(), Subscriber::default());
-            self.socket
-                .send_chunk_to(
-                    ConfirmJoinChannel {
-                        header: ChannelHeader {
-                            channel_id: self.offer_id.into(),
-                            seq: self.sequence.into(),
+        if let Some(client) = self
+            .new_clients
+            .iter()
+            .next()
+            .cloned()
+            .and_then(|q| self.new_clients.take(&q))
+        {
+            let mut retries = 0;
+
+            'outer: while retries < 5 {
+                self.socket
+                    .send_chunk_to(
+                        ConfirmJoinChannel {
+                            header: ChannelHeader {
+                                channel_id: self.offer_id.into(),
+                                seq: self.seq_sent.into(),
+                            },
                         },
-                    },
-                    &client,
-                )
-                .unwrap();
+                        &client.into(),
+                    )
+                    .unwrap();
 
-            // Wait for ack
-            loop {
-                if let Ok(chunk) = self.receiver.recv() {
-                    self.process_chunk(chunk);
-                }
-                if let Some(subscriber) = self.clients.get(&client) {
-                    if subscriber.latest_ack == Some(self.sequence) {
-                        break;
+                let start = std::time::Instant::now();
+
+                // Wait for ack
+                while start.elapsed().as_secs() < 1 {
+                    if let Ok(chunk) = self.receiver.try_recv() {
+                        match chunk.validate() {
+                            Ok(Chunk::Ack(ack)) => {
+                                if <zerocopy::network_endian::U16 as Into<u16>>::into(
+                                    ack.header.seq,
+                                ) == self.seq_sent
+                                    && chunk.addr() == &client.into()
+                                {
+                                    self.clients.insert(client.clone());
+                                    break 'outer;
+                                }
+                            }
+                            Ok(_) => {
+                                self.process_chunk(chunk);
+                            }
+                            Err(err) => {
+                                log::error!("received invalid chunk: {}", err);
+                            }
+                        }
                     }
                 }
+
+                retries += 1;
+                log::debug!("retrying join channel");
             }
 
             Some(client)
@@ -111,10 +255,31 @@ impl Offer {
         }
     }
 
-    fn send_chunk_buffer(&mut self, chunk: ChunkBuffer, packet_size: usize) -> Result<(), std::io::Error> {
-        log::debug!("sending chunk: {:?}", &chunk[..packet_size]);
-        self.socket.send_chunk_buffer_to(&chunk, packet_size, &self.multicast_addr)
-            // TODO: add it to unacknowledged chunks
+    fn send_ack_chunk_buffer(
+        &mut self,
+        chunk: ChunkBuffer,
+        packet_size: usize,
+    ) -> Result<(), std::io::Error> {
+        self.process();
+
+        while self.unacknowledged_chunks_count() > 100 {
+            log::debug!("too many unacknowledged chunks, blockin!");
+            self.wait_for_chunk_timeout(std::time::Duration::from_millis(RETRANSMIT_MILLIS));
+            self.process();
+        }
+
+        self.socket
+            .send_chunk_buffer_to(&chunk, packet_size, &self.multicast_addr)?;
+        // TODO: verify that the ack in the chunk is the same as self.seq_sent + 1
+        self.unacknowledged_chunks
+            .push_back(Some(UnacknowledgedChunk {
+                sent_time: std::time::Instant::now(),
+                buffer: chunk,
+                packet_size,
+                missing_acks: self.clients.clone(),
+                retransmit_count: 0,
+            }));
+        Ok(())
     }
 
     pub fn write_message(&mut self) -> MessageWriter {
@@ -122,6 +287,12 @@ impl Offer {
             offer: self,
             buffer: None,
             cursor: MESSAGE_PAYLOAD_OFFSET,
+        }
+    }
+
+    pub fn flush(&mut self) {
+        while self.seq_ack < self.seq_sent {
+            self.process_blocking();
         }
     }
 }
@@ -146,14 +317,14 @@ impl Write for MessageWriter<'_> {
         while !src_bytes.is_empty() {
             let mut buffer = self.buffer.take().unwrap_or_else(|| {
                 let mut buffer = self.offer.buffer_allocator.allocate();
-                let seq = self.offer.sequence.wrapping_add(1);
+                let seq = self.offer.seq_sent.wrapping_add(1);
                 buffer.init::<Message>(Message {
                     header: ChannelHeader {
                         channel_id: self.offer.offer_id.into(),
                         seq: seq.into(),
                     },
                 });
-                self.offer.sequence = seq;
+                self.offer.seq_sent = seq;
                 buffer
             });
 
@@ -163,7 +334,7 @@ impl Write for MessageWriter<'_> {
             self.cursor += len;
 
             if self.cursor == buffer.len() {
-                self.offer.send_chunk_buffer(buffer, self.cursor)?;
+                self.offer.send_ack_chunk_buffer(buffer, self.cursor)?;
                 self.cursor = MESSAGE_PAYLOAD_OFFSET;
             } else {
                 self.buffer = Some(buffer);
@@ -176,7 +347,7 @@ impl Write for MessageWriter<'_> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if let Some(buffer) = self.buffer.take() {
-            self.offer.send_chunk_buffer(buffer, self.cursor)?;
+            self.offer.send_ack_chunk_buffer(buffer, self.cursor)?;
             self.cursor = MESSAGE_PAYLOAD_OFFSET;
         }
         Ok(())
@@ -252,11 +423,13 @@ impl Publisher {
                 return Ok(Offer {
                     socket: self.socket.socket().try_clone()?,
                     offer_id,
-                    sequence: 0,
+                    seq_sent: 0,
+                    seq_ack: 0,
+                    unacknowledged_chunks: VecDeque::new(),
                     used_offer_ids: self.used_offer_ids.clone(),
                     receiver,
-                    new_clients: SegQueue::new(),
-                    clients: HashMap::default(),
+                    new_clients: HashSet::default(),
+                    clients: HashSet::default(),
                     buffer_allocator: self.buffer_allocator.clone(),
                     multicast_addr: self.multicast_addr.into(),
                 });
