@@ -6,8 +6,9 @@ use std::{
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
 
 use crate::protocol::{
-    kind, Ack, BarrierReached, BarrierReleased, ChunkKindData, ConfirmJoinChannel, Connect,
-    ConnectionInfo, JoinBarrierGroup, JoinChannel, Message,
+    kind, Ack, BarrierReached, BarrierReleased, ChannelDisconnected, ChunkKindData,
+    ConfirmJoinChannel, Connect, ConnectionInfo, JoinBarrierGroup, JoinChannel, LeaveChannel,
+    Message,
 };
 
 #[derive(Debug)]
@@ -21,6 +22,8 @@ pub enum Chunk<'a> {
     JoinBarrierGroup(&'a JoinBarrierGroup),
     BarrierReached(&'a BarrierReached),
     BarrierReleased(&'a BarrierReleased),
+    LeaveChannel(&'a LeaveChannel),
+    ChannelDisconnected(&'a ChannelDisconnected),
 }
 
 impl Chunk<'_> {
@@ -33,6 +36,8 @@ impl Chunk<'_> {
             Chunk::JoinBarrierGroup(join) => Some(join.0.into()),
             Chunk::BarrierReached(b) => Some(b.0.channel_id.into()),
             Chunk::BarrierReleased(b) => Some(b.0.channel_id.into()),
+            Chunk::LeaveChannel(c) => Some(c.0.into()),
+            Chunk::ChannelDisconnected(c) => Some(c.0.into()),
             _ => None,
         }
     }
@@ -180,6 +185,12 @@ impl ChunkBuffer {
             )),
             kind::BARRIER_RELEASED => Ok(Chunk::BarrierReleased(
                 self.get_kind_data_ref::<BarrierReleased>(packet_size)?,
+            )),
+            kind::LEAVE_CHANNEL => Ok(Chunk::LeaveChannel(
+                self.get_kind_data_ref::<LeaveChannel>(packet_size)?,
+            )),
+            kind::CHANNEL_DISCONNECTED => Ok(Chunk::ChannelDisconnected(
+                self.get_kind_data_ref::<ChannelDisconnected>(packet_size)?,
             )),
             kind => Err(ChunkValidationError::InvalidChunkKind(kind)),
         }

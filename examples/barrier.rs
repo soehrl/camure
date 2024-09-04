@@ -13,8 +13,8 @@ fn client(name: &String) {
     log::info!("[{name}] joined barrier group");
 
     let sleep_distribution = rand::distributions::Uniform::new(
-        std::time::Duration::from_secs(1),
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(2),
     );
     let mut rng = rand::thread_rng();
 
@@ -23,7 +23,7 @@ fn client(name: &String) {
         barrier.wait().unwrap();
         log::info!("[{name}] after");
 
-        std::thread::sleep(sleep_distribution.sample(&mut rng));
+        // std::thread::sleep(sleep_distribution.sample(&mut rng));
     }
 }
 
@@ -36,22 +36,22 @@ fn server() {
 
     let mut barrier = p
         .create_barrier_group(multicast::publisher::BarrierGroupDesc {
-            timeout: std::time::Duration::from_secs(1),
-            retries: 5,
+            retransmit_timeout: std::time::Duration::from_secs(1),
+            retransmit_count: 5,
         })
         .unwrap();
     log::info!("[server] barrier group created");
 
     let sleep_distribution = rand::distributions::Uniform::new(
-        std::time::Duration::from_secs(1),
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(2),
     );
     let mut rng = rand::thread_rng();
 
     loop {
-        std::thread::sleep(sleep_distribution.sample(&mut rng));
+        // std::thread::sleep(sleep_distribution.sample(&mut rng));
 
-        while let Some(client) = barrier.try_accept() {
+        while let Ok(client) = barrier.try_accept() {
             log::info!("new client: {client}");
         }
 

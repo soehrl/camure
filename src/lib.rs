@@ -8,5 +8,5 @@ pub(crate) mod protocol;
 pub mod publisher;
 pub mod subscriber;
 
-pub type OfferId = u16;
+pub type ChannelId = u16;
 pub(crate) type SequenceNumber = u16;

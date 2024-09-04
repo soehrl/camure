@@ -1,18 +1,21 @@
 use std::{collections::VecDeque, io::Write, net::SocketAddr, sync::Arc};
 
-use ahash::{HashSet, HashSetExt};
+use ahash::HashSet;
+use crossbeam::channel::RecvTimeoutError;
 use dashmap::DashSet;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::{
     chunk::{Chunk, ChunkBuffer, ChunkBufferAllocator},
     chunk_socket::{ChunkSocket, ReceivedChunk},
-    multiplex_socket::{ChunkReceiver, MultiplexSocket},
-    protocol::{
-        BarrierReleased, ChannelHeader, ConfirmJoinChannel, ConnectionInfo, Message,
-        MESSAGE_PAYLOAD_OFFSET,
+    multiplex_socket::{
+        transmit_to_and_wait, ChunkReceiver, MultiplexSocket, TransmitAndWaitError,
     },
-    OfferId, SequenceNumber,
+    protocol::{
+        BarrierReleased, ChannelDisconnected, ChannelHeader, ConfirmJoinChannel, ConnectionInfo,
+        Message, MESSAGE_PAYLOAD_OFFSET,
+    },
+    ChannelId, SequenceNumber,
 };
 
 const RETRANSMIT_MILLIS: u64 = 100;
@@ -28,7 +31,7 @@ struct UnacknowledgedChunk {
 
 pub struct Offer {
     socket: ChunkSocket,
-    offer_id: OfferId,
+    offer_id: ChannelId,
 
     // The sequence number of the last message sent.
     seq_sent: SequenceNumber,
@@ -42,7 +45,7 @@ pub struct Offer {
     // self.seq_sent.
     unacknowledged_chunks: VecDeque<Option<UnacknowledgedChunk>>,
 
-    used_offer_ids: Arc<DashSet<OfferId>>,
+    used_offer_ids: Arc<DashSet<ChannelId>>,
     receiver: ChunkReceiver,
     new_clients: HashSet<SocketAddr>,
     clients: HashSet<SocketAddr>,
@@ -87,13 +90,9 @@ impl Offer {
                 log::debug!("received ack: {ack_seq} ({offset}) {}", self.seq_sent);
                 if offset > u16::MAX / 2 {
                     // this ack is probably from the past
-                } else {
-                    if let Some(c) = self.unacknowledged_chunks.get_mut(offset as usize) {
-                        if let Some(c) = c {
-                            log::debug!("removing ack from {:?}", c.missing_acks);
-                            c.missing_acks.remove(&chunk.addr().as_socket().unwrap());
-                        }
-                    }
+                } else if let Some(Some(c)) = self.unacknowledged_chunks.get_mut(offset as usize) {
+                    log::debug!("removing ack from {:?}", c.missing_acks);
+                    c.missing_acks.remove(&chunk.addr().as_socket().unwrap());
                 }
             }
             Ok(chunk) => {
@@ -160,12 +159,10 @@ impl Offer {
         }
         if !clients_to_remove.is_empty() {
             log::warn!("clients timed out: {:?}", clients_to_remove);
-            self.clients.retain(|c| !clients_to_remove.contains(&c));
+            self.clients.retain(|c| !clients_to_remove.contains(c));
 
-            for chunk in &mut self.unacknowledged_chunks {
-                if let Some(c) = chunk {
-                    c.missing_acks.retain(|a| !clients_to_remove.contains(a));
-                }
+            for c in &mut self.unacknowledged_chunks.iter_mut().flatten() {
+                c.missing_acks.retain(|a| !clients_to_remove.contains(a));
             }
         }
 
@@ -190,7 +187,7 @@ impl Offer {
         self.process();
     }
 
-    pub fn id(&self) -> OfferId {
+    pub fn id(&self) -> ChannelId {
         self.offer_id
     }
 
@@ -235,7 +232,7 @@ impl Offer {
                                 ) == self.seq_sent
                                     && chunk.addr() == &client.into()
                                 {
-                                    self.clients.insert(client.clone());
+                                    self.clients.insert(client);
                                     break 'outer;
                                 }
                             }
@@ -358,257 +355,166 @@ impl Write for MessageWriter<'_> {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
-enum BarrierClient {
-    Local,
-    Remote(SocketAddr),
+pub struct BarrierGroupDesc {
+    /// The amount of time to wait before retransmitting the barrier release message.
+    pub retransmit_timeout: std::time::Duration,
+
+    /// The number of times the barrier release message is retransmitted, before closing the
+    /// connection to clients that have not acknowledged the release.
+    pub retransmit_count: usize,
 }
 
-enum BarrierState {
-    /// At least one participant has arrived at the barrier.
-    Waiting {
-        arrived: HashSet<BarrierClient>,
-        first_arrival: Option<std::time::Instant>,
-    },
-
-    /// The barrier has been released, but not all participants have acknowledged the release.
-    Released {
-        arrived: HashSet<BarrierClient>, // already arrived for next release
-        required_acks: HashSet<SocketAddr>,
-        released_at: std::time::Instant,
-    },
+#[derive(Debug, Default)]
+struct BarrierGroupState {
+    new_clients: HashSet<SocketAddr>,
+    clients: HashSet<SocketAddr>,
+    arrived: HashSet<SocketAddr>,
+    seq: SequenceNumber,
 }
 
-impl BarrierState {
-    fn arrived(&self) -> &HashSet<BarrierClient> {
-        match self {
-            BarrierState::Waiting { arrived, .. } => arrived,
-            BarrierState::Released { arrived, .. } => arrived,
+impl BarrierGroupState {
+    /// Returns true if the client is connected to the barrier group and false otherwise.
+    fn client_reached_barrier(&mut self, client: SocketAddr, seq: SequenceNumber) -> bool {
+        if self.clients.contains(&client) {
+            if self.seq == seq {
+                self.arrived.insert(client);
+            }
+            true
+        } else {
+            false
         }
     }
-}
 
-pub struct BarrierGroupDesc {
-    /// The amount of time to wait for all clients to arrive.
-    ///
-    /// All clients must arrive to the barrier within this time frame. Clients that do not arrive
-    /// in time will be removed from the barrier group.
-    pub timeout: std::time::Duration,
+    /// Returns if all remotes have arrived at the barrier.
+    fn all_remotes_arrived(&self) -> bool {
+        debug_assert!(self.clients.len() != self.arrived.len() || self.clients == self.arrived);
+        self.clients.len() == self.arrived.len()
+    }
 
-    /// The number of times the server will retransmit the barrier release message.
-    pub retries: u8,
+    /// Processes a single chunk
+    fn process_chunk(&mut self, chunk: Chunk, addr: SocketAddr) -> bool {
+        match chunk {
+            Chunk::JoinBarrierGroup(_) => {
+                self.new_clients.insert(addr);
+                true
+            }
+            Chunk::BarrierReached(reached) => {
+                if self.clients.contains(&addr) {
+                    self.client_reached_barrier(addr, reached.0.seq.into());
+                    true
+                } else {
+                    log::warn!("received barrier reached from non-client");
+                    false
+                }
+            }
+            Chunk::LeaveChannel(_) => {
+                if self.clients.contains(&addr) {
+                    self.clients.remove(&addr);
+                    self.arrived.remove(&addr);
+                }
+                false
+            }
+            _ => {
+                log::warn!("received invalid chunk: {chunk:?}");
+                self.clients.contains(&addr)
+            }
+        }
+    }
 }
 
 pub struct BarrierGroup {
-    id: OfferId,
+    channel_id: ChannelId,
     desc: BarrierGroupDesc,
-    new_clients: HashSet<SocketAddr>,
-    clients: HashSet<BarrierClient>,
-    seq: SequenceNumber,
-    state: BarrierState,
+    state: BarrierGroupState,
     receiver: ChunkReceiver,
     socket: ChunkSocket,
-    multicast_addr: SockAddr,
+    multicast_addr: SocketAddr,
 }
 
 impl BarrierGroup {
-    fn client_reached_barrier(&mut self, client: BarrierClient, seq: SequenceNumber) {
-        // log::debug!("{client:?} reached barrier group {} ({})", self.id, seq);
-
-        match &mut self.state {
-            BarrierState::Waiting {
-                arrived,
-                first_arrival,
-            } => {
-                if self.seq == seq && self.clients.contains(&client) {
-                    arrived.insert(client);
-                    if first_arrival.is_none() {
-                        *first_arrival = Some(std::time::Instant::now());
-                    }
-                }
-            }
-            BarrierState::Released {
-                arrived,
-                required_acks,
-                released_at: _,
-            } => {
-                if self.seq.wrapping_add(1) == seq && self.clients.contains(&client) {
-                    // If this client has already arrived for the next release, it must have sent
-                    // an ack for the previous one as it would still be waiting at the barrier. So
-                    // the ack must have been lost.
-                    if let BarrierClient::Remote(addr) = &client {
-                        required_acks.remove(addr);
-                    }
-                    arrived.insert(client);
-                }
-            }
-        }
-    }
-
-    fn process_chunk(&mut self, chunk: ReceivedChunk) {
-        match chunk.validate() {
-            Ok(Chunk::JoinBarrierGroup(_)) => {
-                log::debug!(
-                    "{} requested to join barrier group {}",
-                    chunk.addr().as_socket().unwrap(),
-                    self.id
-                );
-                self.new_clients.insert(chunk.addr().as_socket().unwrap());
-            }
-            Ok(Chunk::BarrierReached(reached)) => {
-                let seq: u16 = reached.0.seq.into();
-                let addr = chunk.addr().as_socket().unwrap();
-                let client = BarrierClient::Remote(addr);
-                self.client_reached_barrier(client, seq);
-            }
-            Ok(Chunk::Ack(ack)) => {
-                match &mut self.state {
-                    BarrierState::Waiting {
-                        arrived: _,
-                        first_arrival: _,
-                    } => {
-                        // Ack is not expected in this state
-                    }
-                    BarrierState::Released {
-                        arrived,
-                        required_acks,
-                        released_at: _,
-                    } => {
-                        let seq: u16 = ack.header.seq.into();
-                        let addr = chunk.addr().as_socket().unwrap();
-
-                        if self.seq == seq {
-                            required_acks.remove(&addr);
-                            if required_acks.is_empty() {
-                                let mut arrived2 = HashSet::default();
-                                std::mem::swap(&mut arrived2, arrived);
-                                self.state = BarrierState::Waiting {
-                                    arrived: arrived2,
-                                    first_arrival: Some(std::time::Instant::now()),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(chunk) => {
-                log::debug!("ignore unexpected chunk: {:?}", chunk);
-            }
-            Err(err) => {
-                log::error!("received invalid chunk: {}", err);
-            }
-        }
-    }
-
     fn try_process(&mut self) -> bool {
         let mut processed = false;
         while let Ok(chunk) = self.receiver.try_recv() {
-            self.process_chunk(chunk);
-            processed = true;
+            if let (Ok(chunk), Some(addr)) = (chunk.validate(), chunk.addr().as_socket()) {
+                if !self.state.process_chunk(chunk, addr) {
+                    let _ = self
+                        .socket
+                        .send_chunk_to(&ChannelDisconnected(self.channel_id.into()), &addr.into());
+                }
+                processed = true;
+            }
         }
         processed
     }
 
-    fn process(&mut self) -> bool {
-        // Wait for first chunk...
+    fn process(&mut self) {
         if let Ok(chunk) = self.receiver.recv() {
-            // ... process it...
-            self.process_chunk(chunk);
-
-            // ... and process everything arrived in the meantime
-            self.try_process();
-
-            true
-        } else {
-            false
+            if let (Ok(chunk), Some(addr)) = (chunk.validate(), chunk.addr().as_socket()) {
+                if !self.state.process_chunk(chunk, addr) {
+                    let _ = self
+                        .socket
+                        .send_chunk_to(&ChannelDisconnected(self.channel_id.into()), &addr.into());
+                }
+            }
         }
+        self.try_process();
     }
 
-    fn process_timeout(&mut self, timeout: std::time::Duration) -> bool {
-        // Wait for first chunk...
-        if let Ok(chunk) = self.receiver.recv_timeout(timeout) {
-            // ... process it...
-            self.process_chunk(chunk);
-
-            // ... and process everything arrived in the meantime
-            self.try_process();
-
-            true
-        } else {
-            false
-        }
+    pub fn accept_client(&mut self, client: SocketAddr) -> Result<(), TransmitAndWaitError> {
+        transmit_to_and_wait(
+            &self.socket,
+            &client,
+            &ConfirmJoinChannel {
+                header: ChannelHeader {
+                    channel_id: self.channel_id.into(),
+                    seq: self.state.seq.into(),
+                },
+            },
+            self.desc.retransmit_timeout,
+            self.desc.retransmit_count,
+            &self.receiver,
+            |chunk, addr| {
+                if let Chunk::Ack(ack) = chunk {
+                    let ack_seq: u16 = ack.header.seq.into();
+                    if ack_seq == self.state.seq && addr == client {
+                        log::debug!("client {} joined barrier group", client);
+                        self.state.clients.insert(addr);
+                        return true;
+                    }
+                } else {
+                    self.state.process_chunk(chunk, addr);
+                }
+                false
+            },
+        )
     }
 
-    pub fn try_accept(&mut self) -> Option<SocketAddr> {
+    pub fn try_accept(&mut self) -> Result<SocketAddr, TransmitAndWaitError> {
         self.try_process();
 
         if let Some(client) = self
+            .state
             .new_clients
             .iter()
             .next()
             .copied()
-            .and_then(|q| self.new_clients.take(&q))
+            .and_then(|q| self.state.new_clients.take(&q))
         {
-            let mut retries = 0;
-
-            'outer: while retries < 5 {
-                self.socket
-                    .send_chunk_to(
-                        &ConfirmJoinChannel {
-                            header: ChannelHeader {
-                                channel_id: self.id.into(),
-                                seq: self.id.into(),
-                            },
-                        },
-                        &client.into(),
-                    )
-                    .unwrap();
-
-                let start = std::time::Instant::now();
-
-                // Wait for ack
-                while start.elapsed().as_secs() < 1 {
-                    if let Ok(chunk) = self.receiver.try_recv() {
-                        match chunk.validate() {
-                            Ok(Chunk::Ack(ack)) => {
-                                if <zerocopy::network_endian::U16 as Into<u16>>::into(
-                                    ack.header.seq,
-                                ) == self.seq
-                                    && chunk.addr() == &client.into()
-                                {
-                                    self.clients.insert(BarrierClient::Remote(client.clone()));
-                                    break 'outer;
-                                }
-                            }
-                            Ok(_) => {
-                                self.process_chunk(chunk);
-                            }
-                            Err(err) => {
-                                log::error!("received invalid chunk: {}", err);
-                            }
-                        }
-                    }
-                }
-
-                retries += 1;
-                log::debug!("retrying join channel");
-            }
-
-            Some(client)
+            log::debug!("accepting client {}", client);
+            self.accept_client(client)?;
+            Ok(client)
         } else {
-            None
+            Err(TransmitAndWaitError::RecvError(RecvTimeoutError::Timeout))
         }
     }
 
-    pub fn empty(&self) -> bool {
-        // Only the local client is present
-        self.clients.len() == 1
+    pub fn has_remotes(&self) -> bool {
+        !self.state.clients.is_empty()
     }
 
     pub fn try_wait(&mut self) -> bool {
         self.try_process();
-        if self.state.arrived().len() == self.clients.len() - 1 {
-            // Only we are missing
+        if self.state.all_remotes_arrived() {
             self.wait();
             true
         } else {
@@ -617,100 +523,90 @@ impl BarrierGroup {
     }
 
     pub fn wait(&mut self) {
-        // Arrive at the barrier
-        self.client_reached_barrier(BarrierClient::Local, self.seq);
-
         // Wait until everyone has arrived
-        loop {
-            match &self.state {
-                BarrierState::Waiting {
-                    arrived,
-                    first_arrival,
-                } => {
-                    if arrived.len() == self.clients.len() {
-                        debug_assert_eq!(arrived, &self.clients);
-                        break;
-                    } else {
-                        let now = std::time::Instant::now();
-                        let deadline = first_arrival.unwrap() + self.desc.timeout;
-                        if deadline > now {
-                            self.process_timeout(deadline - now);
-                        } else {
-                            log::warn!(
-                                "timeout waiting for clients to arrive, removing: {:?}",
-                                self.clients.difference(&arrived)
-                            );
-                            self.clients = arrived.clone();
-                            break;
-                        }
-                    }
-                }
-                BarrierState::Released { .. } => unreachable!(),
-            }
+        if !self.state.all_remotes_arrived() {
+            self.process();
         }
 
         // Release the barrier
+        let release_seq = self.state.seq.into();
+        // Alread increment the seq here, to allow remotes to allready confirm the next barrier
+        // while we are waiting for the acks.
+        self.state.seq = self.state.seq.wrapping_add(1);
+        let mut missing_acks = self.state.arrived.clone();
+        self.state.arrived.clear();
+
         let release_time = std::time::Instant::now();
-        self.state = BarrierState::Released {
-            arrived: HashSet::with_capacity(self.clients.len()),
-            required_acks: self
-                .clients
-                .iter()
-                .filter_map(|c| {
-                    if let BarrierClient::Remote(addr) = c {
-                        Some(addr.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            released_at: release_time,
-        };
 
-        // Wait until barrier release is acknowledged
-        'outer: for _ in 0..self.desc.retries + 1 {
-            self.socket.send_chunk_to(
-                &BarrierReleased(ChannelHeader {
-                    channel_id: self.id.into(),
-                    seq: self.seq.into(),
-                }),
-                &self.multicast_addr,
-            ).unwrap();
-
-            let deadline = release_time + self.desc.timeout;
-            loop {
-                if let BarrierState::Released {
-                    arrived,
-                    required_acks,
-                    released_at: _,
-                } = &self.state
-                {
-                    if required_acks.is_empty() {
-                        self.state = BarrierState::Waiting {
-                            arrived: arrived.clone(),
-                            first_arrival: if arrived.len() > 0 {
-                                Some(std::time::Instant::now())
-                            } else {
-                                None
-                            },
-                        };
-                        break 'outer;
-                    } else {
-                        let now = std::time::Instant::now();
-                        if now < deadline {
-                            self.process_timeout(deadline - now);
+        let _ = transmit_to_and_wait(
+            &self.socket,
+            &self.multicast_addr,
+            &BarrierReleased(ChannelHeader {
+                channel_id: self.channel_id.into(),
+                seq: release_seq,
+            }),
+            self.desc.retransmit_timeout,
+            self.desc.retransmit_count,
+            &self.receiver,
+            |chunk, addr| {
+                match chunk {
+                    Chunk::Ack(ack) => {
+                        if self.state.clients.contains(&addr) {
+                            if release_seq == ack.header.seq {
+                                missing_acks.remove(&addr);
+                            }
                         } else {
-                            break;
+                            log::warn!("received ack from non-client");
+                            let _ = self.socket.send_chunk_to(
+                                &ChannelDisconnected(self.channel_id.into()),
+                                &addr.into(),
+                            );
                         }
                     }
-                } else {
-                    break;
+                    Chunk::BarrierReached(reached) => {
+                        if self.state.clients.contains(&addr) {
+                            let reached_seq: u16 = reached.0.seq.into();
+                            if reached_seq == self.state.seq {
+                                missing_acks.remove(&addr);
+                                self.state.arrived.insert(addr);
+                            }
+                        } else {
+                            log::warn!("received barrier reached from non-client");
+                            let _ = self.socket.send_chunk_to(
+                                &ChannelDisconnected(self.channel_id.into()),
+                                &addr.into(),
+                            );
+                        }
+                    }
+                    _ => {
+                        if !self.state.process_chunk(chunk, addr) {
+                            missing_acks.remove(&addr);
+                            let _ = self.socket.send_chunk_to(
+                                &ChannelDisconnected(self.channel_id.into()),
+                                &addr.into(),
+                            );
+                        }
+                    }
                 }
+
+                missing_acks.is_empty()
+            },
+        );
+        log::debug!(
+            "barrier released confirmation time: {:?}",
+            release_time.elapsed()
+        );
+
+        if !missing_acks.is_empty() {
+            log::warn!("clients timed out: {:?}", missing_acks);
+            for c in &missing_acks {
+                let _ = self
+                    .socket
+                    .send_chunk_to(&ChannelDisconnected(self.channel_id.into()), &(*c).into());
+                self.state.clients.remove(c);
+                debug_assert!(!self.state.arrived.contains(c));
             }
         }
-
-        // Prepare for next barrier
-        self.seq = self.seq.wrapping_add(1);
     }
 }
 
@@ -780,25 +676,16 @@ impl Publisher {
         &self,
         desc: BarrierGroupDesc,
     ) -> Result<BarrierGroup, CreateChannelError> {
-        for offer_id in 0..=OfferId::MAX {
+        for offer_id in 0..=ChannelId::MAX {
             if self.used_channel_ids.insert(offer_id) {
-                let mut clients = HashSet::default();
-                clients.insert(BarrierClient::Local);
-
                 let receiver = self.socket.listen_to_channel(offer_id);
                 return Ok(BarrierGroup {
-                    id: offer_id,
-                    new_clients: HashSet::default(),
+                    channel_id: offer_id,
+                    state: BarrierGroupState::default(),
                     receiver,
                     desc,
-                    clients,
-                    seq: 0,
-                    state: BarrierState::Waiting {
-                        arrived: HashSet::default(),
-                        first_arrival: None,
-                    },
                     socket: self.socket.socket().try_clone()?,
-                    multicast_addr: self.multicast_addr.into(),
+                    multicast_addr: self.multicast_addr,
                 });
             }
         }
@@ -807,7 +694,7 @@ impl Publisher {
     }
 
     pub fn create_offer(&self) -> Result<Offer, CreateChannelError> {
-        for offer_id in 0..=OfferId::MAX {
+        for offer_id in 0..=ChannelId::MAX {
             if self.used_channel_ids.insert(offer_id) {
                 let receiver = self.socket.listen_to_channel(offer_id);
                 return Ok(Offer {

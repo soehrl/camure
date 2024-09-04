@@ -14,12 +14,12 @@ use zerocopy::FromBytes;
 use crate::{
     chunk::{Chunk, ChunkBufferAllocator},
     chunk_socket::{ChunkSocket, ReceivedChunk},
-    multiplex_socket::{wait_for_chunk, ChunkReceiver, MultiplexSocket},
+    multiplex_socket::{transmit_and_wait, ChunkReceiver, MultiplexSocket},
     protocol::{
         kind, Ack, BarrierReached, ChannelHeader, ChunkKindData, ConnectionInfo, JoinBarrierGroup,
         JoinChannel, MESSAGE_PAYLOAD_OFFSET,
     },
-    OfferId, SequenceNumber,
+    ChannelId, SequenceNumber,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -118,18 +118,16 @@ impl Subscription {
                     let offset = seq.wrapping_sub(self.sequence.wrapping_add(1));
                     if offset > u16::MAX / 2 {
                         // This is most likely an old packet, just ignore it
+                    } else if seq != self.sequence.wrapping_add(1) {
+                        panic!(
+                            "unexpected sequence number: expected {}, got {}",
+                            self.sequence.wrapping_add(1),
+                            seq
+                        );
                     } else {
-                        if seq != self.sequence.wrapping_add(1) {
-                            panic!(
-                                "unexpected sequence number: expected {}, got {}",
-                                self.sequence.wrapping_add(1),
-                                seq
-                            );
-                        } else {
-                            log::debug!("received message: {:?}", msg);
-                            self.sequence = seq;
-                            return Ok(Message::SingleChunk(chunk));
-                        }
+                        log::debug!("received message: {:?}", msg);
+                        self.sequence = seq;
+                        return Ok(Message::SingleChunk(chunk));
                     }
                 }
                 Ok(chunk) => {
@@ -148,54 +146,79 @@ pub struct Disconnected;
 
 const CONNECTION_INFO_PACKET_SIZE: usize = std::mem::size_of::<ConnectionInfo>() + 1;
 
-pub struct Barrier {
-    channel_id: OfferId,
-    control_receiver: ChunkReceiver,
-    multicast_receiver: ChunkReceiver,
-    seq: SequenceNumber,
-    control_socket: ChunkSocket,
-    timeout: std::time::Duration,
+pub enum Barrier {
+    Connected {
+        channel_id: ChannelId,
+        control_receiver: ChunkReceiver,
+        multicast_receiver: ChunkReceiver,
+        seq: SequenceNumber,
+        control_socket: ChunkSocket,
+        timeout: std::time::Duration,
+    },
+    Disconnected,
 }
 
 impl Barrier {
     pub fn wait(&mut self) -> Result<(), Disconnected> {
-        // Try for 5 times
-        for _ in 0..5 {
-            self.control_socket
-                .send_chunk(&BarrierReached(ChannelHeader {
-                    seq: self.seq.into(),
-                    channel_id: self.channel_id.into(),
-                }));
-
-            match wait_for_chunk(
-                &self.multicast_receiver,
-                self.timeout,
-                |chunk| match chunk {
-                    Chunk::BarrierReleased(release) => {
-                        let seq: u16 = release.0.seq.into();
-                        seq == self.seq
-                    }
-                    _ => false,
-                },
-            ) {
-                Ok(_) => {
-                    self.control_socket.send_chunk(&Ack {
-                        header: ChannelHeader{
-                            seq: self.seq.into(),
-                            channel_id: self.channel_id.into(),
-                        }
-                    });
-
-                    self.seq = self.seq.wrapping_add(1);
-                    return Ok(());
+        match self {
+            Barrier::Connected {
+                channel_id,
+                control_receiver,
+                multicast_receiver,
+                seq,
+                control_socket,
+                timeout,
+            } => {
+                #[derive(Debug)]
+                enum Result {
+                    BarrierReached,
+                    Disconnected,
                 }
-                Err(RecvTimeoutError::Disconnected) => return Err(Disconnected),
-                Err(RecvTimeoutError::Timeout) => {}
+
+                let result = transmit_and_wait(
+                    control_socket,
+                    &BarrierReached(ChannelHeader {
+                        seq: (*seq).into(),
+                        channel_id: (*channel_id).into(),
+                    }),
+                    *timeout,
+                    5,
+                    &[multicast_receiver, control_receiver],
+                    |chunk, _| match chunk {
+                        Chunk::BarrierReleased(release) => {
+                            let _ = control_socket.send_chunk(&Ack {
+                                header: ChannelHeader {
+                                    seq: release.0.seq,
+                                    channel_id: release.0.channel_id,
+                                },
+                            });
+
+                            let release_seq: u16 = release.0.seq.into();
+                            if release_seq == *seq {
+                                Some(Result::BarrierReached)
+                            } else {
+                                None
+                            }
+                        }
+                        Chunk::ChannelDisconnected(_) => Some(Result::Disconnected),
+                        _ => None,
+                    },
+                );
+
+                match result {
+                    Ok(Result::BarrierReached) => {
+                        *seq = seq.wrapping_add(1);
+                        Ok(())
+                    }
+                    _ => {
+                        log::error!("disconnected: {result:?}");
+                        *self = Barrier::Disconnected;
+                        Err(Disconnected)
+                    }
+                }
             }
+            Barrier::Disconnected => Err(Disconnected),
         }
-
-
-        Err(Disconnected)
     }
 }
 
@@ -206,7 +229,7 @@ struct Channel {
 }
 
 pub struct Subscriber {
-    joined_channels: HashSet<OfferId>,
+    joined_channels: HashSet<ChannelId>,
     control_socket: MultiplexSocket,
     multicast_socket: MultiplexSocket,
     buffer_allocator: Arc<ChunkBufferAllocator>,
@@ -285,7 +308,7 @@ impl Subscriber {
 
     fn join_channel<T: ChunkKindData>(
         &mut self,
-        id: OfferId,
+        id: ChannelId,
         join_msg: &T,
     ) -> Result<Channel, JoinChannelError> {
         let deadline = std::time::Instant::now() + self.timeout;
@@ -339,20 +362,20 @@ impl Subscriber {
         Err(JoinChannelError::Timeout)
     }
 
-    pub fn join_barrier_group(&mut self, id: OfferId) -> Result<Barrier, JoinChannelError> {
+    pub fn join_barrier_group(&mut self, id: ChannelId) -> Result<Barrier, JoinChannelError> {
         let channel = self.join_channel(id, &JoinBarrierGroup(id.into()))?;
 
-        return Ok(Barrier {
+        Ok(Barrier::Connected {
             control_receiver: channel.control_receiver,
             multicast_receiver: channel.multicast_receiver,
             seq: channel.seq,
             control_socket: self.control_socket.socket().try_clone()?,
             channel_id: id,
-            timeout: std::time::Duration::from_secs(1),
-        });
+            timeout: std::time::Duration::from_secs(2),
+        })
     }
 
-    pub fn subscribe(&mut self, offer_id: OfferId) -> Result<Subscription, JoinChannelError> {
+    pub fn subscribe(&mut self, offer_id: ChannelId) -> Result<Subscription, JoinChannelError> {
         let channel = self.join_channel(
             offer_id,
             &JoinChannel {
@@ -360,13 +383,13 @@ impl Subscriber {
             },
         )?;
 
-        return Ok(Subscription {
+        Ok(Subscription {
             control_receiver: channel.control_receiver,
             multicast_receiver: channel.multicast_receiver,
             buffer_allocator: self.buffer_allocator.clone(),
             sequence: channel.seq,
             chunks: VecDeque::new(),
             control_socket: self.control_socket.socket().try_clone()?,
-        });
+        })
     }
 }
