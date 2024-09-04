@@ -379,6 +379,15 @@ enum BarrierState {
     },
 }
 
+impl BarrierState {
+    fn arrived(&self) -> &HashSet<BarrierClient> {
+        match self {
+            BarrierState::Waiting { arrived, .. } => arrived,
+            BarrierState::Released { arrived, .. } => arrived,
+        }
+    }
+}
+
 pub struct BarrierGroupDesc {
     /// The amount of time to wait for all clients to arrive.
     ///
@@ -588,6 +597,22 @@ impl BarrierGroup {
             Some(client)
         } else {
             None
+        }
+    }
+
+    pub fn empty(&self) -> bool {
+        // Only the local client is present
+        self.clients.len() == 1
+    }
+
+    pub fn try_wait(&mut self) -> bool {
+        self.try_process();
+        if self.state.arrived().len() == self.clients.len() - 1 {
+            // Only we are missing
+            self.wait();
+            true
+        } else {
+            false
         }
     }
 
