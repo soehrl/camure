@@ -163,6 +163,7 @@ impl_chunk_header!(SessionJoin);
 pub struct SessionWelcome {
     pub multicast_addr: UnvalidatedSocketAddr,
     pub chunk_size: U16,
+    pub heartbeat_interval: U64,
 }
 impl_chunk_header!(SessionWelcome);
 

@@ -2,9 +2,9 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 
-use ahash::HashSet;
 use dashmap::DashMap;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use zerocopy::FromBytes;
@@ -13,10 +13,19 @@ use crate::{
     barrier::{
         BarrierGroupCoordinator, BarrierGroupCoordinatorState, BarrierGroupMember,
         BarrierGroupMemberState,
-    }, broadcast::{BroadcastGroupReceiver, BroadcastGroupReceiverState, BroadcastGroupSender, BroadcastGroupSenderState}, chunk::{Chunk, ChunkBufferAllocator}, group::{GroupCoordinator, GroupCoordinatorTypeImpl, GroupMember, GroupMemberTypeImpl}, multiplex_socket::{Callback, CallbackReason, MultiplexSocket}, protocol::{
-        self, GroupType, SessionHeartbeat, SessionJoin, SessionWelcome, CHUNK_ID_SESSION_WELCOME,
+    },
+    broadcast::{
+        BroadcastGroupReceiver, BroadcastGroupReceiverState, BroadcastGroupSender,
+        BroadcastGroupSenderState,
+    },
+    chunk::{Chunk, ChunkBufferAllocator},
+    group::{GroupCoordinator, GroupCoordinatorTypeImpl, GroupMember, GroupMemberTypeImpl},
+    multiplex_socket::{Callback, CallbackReason, MultiplexSocket},
+    protocol::{
+        SessionHeartbeat, SessionJoin, SessionWelcome, CHUNK_ID_SESSION_WELCOME,
         WELCOME_PACKET_SIZE,
-    }, utils::ExponentialBackoff
+    },
+    utils::ExponentialBackoff,
 };
 
 pub(crate) struct MemberVitals {
@@ -234,7 +243,12 @@ impl Coordinator {
         let socket = MultiplexSocket::with_callback(
             socket,
             chunk_allocator,
-            Self::create_callback(multicast_address, config.chunk_size, client_vitals.clone()),
+            Self::create_callback(
+                multicast_address,
+                config.chunk_size,
+                config.heartbeat_interval,
+                client_vitals.clone(),
+            ),
         );
 
         Ok(Self {
@@ -248,6 +262,7 @@ impl Coordinator {
     fn create_callback(
         multicast_address: SocketAddr,
         chunk_size: u16,
+        heartbeat_interval: Duration,
         member_vitals: Arc<MemberVitals>,
     ) -> impl Callback {
         move |socket, reason| match reason {
@@ -268,6 +283,7 @@ impl Coordinator {
                         &SessionWelcome {
                             multicast_addr: multicast_address.into(),
                             chunk_size: chunk_size.into(),
+                            heartbeat_interval: (heartbeat_interval.as_nanos() as u64).into(),
                         },
                         addr,
                     )
@@ -450,7 +466,9 @@ impl Member {
         };
 
         coordinator_socket
-            .set_read_timeout(None)
+            .set_read_timeout(Some(Duration::from_nanos(
+                welcome.heartbeat_interval.into(),
+            )))
             .map_err(JoinSessionError::RecvError)?;
 
         let multicast_addr: SocketAddr = (&welcome.multicast_addr)
@@ -491,6 +509,7 @@ impl Member {
             buffer_allocator.clone(),
             move |socket, reason| match reason {
                 CallbackReason::Timeout => {
+                    log::trace!("sending heartbeat to coordinator");
                     // We ran into a timeout, which is set to the heartbeat interval
                     // TODO: what to do in case of an error?
                     let _ = socket.send_chunk_to(&SessionHeartbeat, &coordinator_address_copy);
