@@ -7,7 +7,6 @@ edition = "2021"
 ahash = "0.8.11"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 dashmap = "6.0.1"
-env_logger = "0.11.5"
 log = "0.4.22"
 paste = "1.0.15"
 socket2 = "0.5.7"
@@ -15,4 +14,5 @@ thiserror = "1.0.63"
 zerocopy = { version = "0.7.35", features = ["derive"] }
 
 [dev-dependencies]
+env_logger = "0.11.5"
 rand = "0.8.5"

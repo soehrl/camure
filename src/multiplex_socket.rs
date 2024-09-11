@@ -1,170 +1,481 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use ahash::HashMap;
-use crossbeam::channel::{Receiver, RecvError, RecvTimeoutError, Select, Sender};
-use socket2::Socket;
+use crossbeam::channel::{Receiver, RecvTimeoutError, Select, Sender, TryRecvError, TrySendError};
+use dashmap::DashMap;
+use socket2::{SockAddr, Socket};
 
 use crate::{
-    chunk::{Chunk, ChunkBufferAllocator},
+    chunk::{Chunk, ChunkBuffer, ChunkBufferAllocator},
     chunk_socket::{ChunkSocket, ReceivedChunk},
-    protocol::ChunkKindData,
+    protocol::{self, ChunkHeader, GroupDisconnected},
+    utils::display_addr,
 };
-
-type ChannelId = u16;
 
 pub type ChunkSender = Sender<ReceivedChunk>;
 pub type ChunkReceiver = Receiver<ReceivedChunk>;
-type ChannelListenerReceiver = Receiver<(ChannelId, ChunkSender)>;
-type ChannelListenerSender = Sender<(ChannelId, ChunkSender)>;
 
-struct ChannelConnections {
-    channel_receiver: ChannelListenerReceiver,
-    channels: HashMap<ChannelId, ChunkSender>,
+pub enum CallbackReason<'a> {
+    UnhandledChunk {
+        chunk: Chunk<'a>,
+        addr: &'a SockAddr,
+    },
+    Timeout,
 }
 
-impl ChannelConnections {
-    fn new(channel_receiver: ChannelListenerReceiver) -> Self {
-        Self {
-            channel_receiver,
-            channels: HashMap::default(),
-        }
-    }
+pub trait Callback: Fn(&MultiplexSocket, CallbackReason) + Send + 'static {}
+impl<F: Fn(&MultiplexSocket, CallbackReason) + Send + 'static> Callback for F {}
 
-    fn send(&mut self, channel_id: ChannelId, chunk: ReceivedChunk) -> Result<(), RecvError> {
-        let mut chunk = Some(chunk);
+// #[derive(thiserror::Error, Debug)]
+// pub enum SendError {
+//     #[error("I/O error: {0}")]
+//     Io(#[from] std::io::Error),
 
-        while let Some(c) = chunk.take() {
-            match self.channels.get(&channel_id) {
-                Some(sender) => {
-                    if let Err(err) = sender.send(c) {
-                        // This sender is disconnected, remove it from the map and try again.
-                        self.channels.remove(&channel_id);
-                        chunk = Some(err.0);
-                    }
-                }
-                None => {
-                    let (id, sender) = self.channel_receiver.recv()?;
-                    self.channels.insert(id, sender);
-                    log::debug!("received channel {}", id);
-                    chunk = Some(c);
-                }
-            }
-        }
+//     #[error("buffer is not a valid chunk")]
+//     InvalidChunk,
+// }
 
-        Ok(())
-    }
+#[derive(thiserror::Error, Debug)]
+enum ForwardChunkError {
+    #[error("channel is full")]
+    RecvBufferFull(ReceivedChunk),
+
+    #[error("channel is disconnected")]
+    Disconnected(ReceivedChunk),
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum SendError {
+pub enum ProcessError<E> {
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    RecvError(#[from] RecvTimeoutError),
 
-    #[error("buffer is not a valid chunk")]
-    InvalidChunk,
+    #[error("callback error: {0}")]
+    Callback(E),
+}
+
+pub struct Channel {
+    socket: Arc<MultiplexSocket>,
+    receiver: ChunkReceiver,
+    channel_id: protocol::GroupId,
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.socket.channels.remove(&self.channel_id);
+        // debug_assert!(self
+        //     .receiver
+        //     .try_recv()
+        //     .is_err_and(|e| e == TryRecvError::Disconnected));
+    }
+}
+
+impl Channel {
+    #[inline]
+    pub fn id(&self) -> protocol::GroupId {
+        self.channel_id
+    }
+
+    #[inline]
+    pub fn buffer_allocator(&self) -> &Arc<ChunkBufferAllocator> {
+        self.socket.buffer_allocator()
+    }
+
+    #[inline]
+    pub fn send_chunk<H: ChunkHeader>(&self, kind_data: &H) -> Result<(), std::io::Error> {
+        self.socket.send_chunk(kind_data)
+    }
+
+    #[inline]
+    pub fn send_chunk_buffer_to(
+        &self,
+        buffer: &ChunkBuffer,
+        packet_size: usize,
+        addr: &SockAddr,
+    ) -> Result<(), std::io::Error> {
+        self.socket.send_chunk_buffer_to(buffer, packet_size, addr)
+    }
+
+    #[inline]
+    pub fn send_chunk_to<H: ChunkHeader>(
+        &self,
+        kind_data: &H,
+        addr: &SockAddr,
+    ) -> Result<(), std::io::Error> {
+        self.socket.send_chunk_to(kind_data, addr)
+    }
+
+    #[inline]
+    pub fn send_chunk_with_payload_to<H: ChunkHeader>(
+        &self,
+        kind_data: &H,
+        payload: &[u8],
+        addr: &SockAddr,
+    ) -> Result<(), std::io::Error> {
+        self.socket
+            .send_chunk_with_payload_to(kind_data, payload, addr)
+    }
+
+    #[inline]
+    pub fn receiver(&self) -> &ChunkReceiver {
+        &self.receiver
+    }
+
+    #[inline]
+    pub fn recv(&self) -> Result<ReceivedChunk, std::io::Error> {
+        self.receiver
+            .recv()
+            .map_err(|_| std::io::ErrorKind::NotConnected.into())
+    }
+
+    #[inline]
+    pub fn try_recv(&self) -> Result<Option<ReceivedChunk>, std::io::Error> {
+        match self.receiver.try_recv() {
+            Ok(chunk) => Ok(Some(chunk)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(std::io::ErrorKind::NotConnected.into()),
+        }
+    }
+
+    #[inline]
+    pub fn recv_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<ReceivedChunk, std::io::Error> {
+        self.receiver
+            .recv_deadline(deadline)
+            .map_err(|err| match err {
+                RecvTimeoutError::Timeout => std::io::ErrorKind::TimedOut.into(),
+                RecvTimeoutError::Disconnected => std::io::ErrorKind::NotConnected.into(),
+            })
+    }
+
+    // #[inline]
+    // pub fn recv_timeout(&self, timeout: Duration) -> Result<ReceivedChunk, ()> {
+    //     self.receiver.recv_timeout(timeout).map_err(|_| ())
+    // }
+
+    /// Processes chunks for a duration
+    pub fn process_for<T, E, F: Fn(Chunk, &SockAddr) -> Result<Option<T>, E>>(
+        &self,
+        duration: std::time::Duration,
+        p: F,
+    ) -> Result<T, ProcessError<E>> {
+        let deadline = std::time::Instant::now() + duration;
+        self.process_until(deadline, p)
+    }
+
+    /// Processes chunks until the deadline is reached.
+    pub fn process_until<T, E, F: Fn(Chunk, &SockAddr) -> Result<Option<T>, E>>(
+        &self,
+        deadline: std::time::Instant,
+        p: F,
+    ) -> Result<T, ProcessError<E>> {
+        loop {
+            let chunk = self.receiver.recv_deadline(deadline)?;
+
+            if let Ok(c) = chunk.validate() {
+                match p(c, chunk.addr()) {
+                    Ok(Some(v)) => return Ok(v),
+                    Ok(None) => {}
+                    Err(e) => return Err(ProcessError::Callback(e)),
+                }
+            } else {
+                unreachable!("should be filtered out by the socket");
+            }
+        }
+    }
+
+    // pub fn wait_for_chunk<T, P: FnMut(Chunk, &SockAddr) -> Option<T>>(
+    //     &mut self,
+    //     timeout: std::time::Duration,
+    //     mut p: P,
+    // ) -> Result<T, RecvTimeoutError> {
+    //     let start = std::time::Instant::now();
+    //     let deadline = start + timeout;
+
+    //     loop {
+    //         match self.receiver.recv_deadline(deadline) {
+    //             Ok(chunk) => {
+    //                 if let Ok(c) = chunk.validate() {
+    //                     if let Some(val) = p(c, chunk.addr()) {
+    //                         return Ok(val);
+    //                     }
+    //                 }
+    //             }
+    //             Err(err) => return Err(err),
+    //         }
+    //     }
+    // }
 }
 
 pub struct MultiplexSocket {
-    socket: ChunkSocket,
-    channel_sender: ChannelListenerSender,
+    inner: ChunkSocket,
+    channels: DashMap<protocol::GroupId, ChunkSender>,
 }
 
 impl MultiplexSocket {
-    fn receiver_thread<F: Fn(&ChunkSocket, ReceivedChunk) + Send + 'static>(
-        socket: ChunkSocket,
-        channel_sender_receiver: ChannelListenerReceiver,
-        process_unchannelled_chunk: F,
-    ) {
-        let mut channel_connections = ChannelConnections::new(channel_sender_receiver);
+    fn forward_chunk(
+        &self,
+        channel_id: protocol::GroupId,
+        chunk: ReceivedChunk,
+        cache: &mut HashMap<protocol::GroupId, ChunkSender>,
+    ) -> Result<(), ForwardChunkError> {
+        // First try to send the chunk to the cached channel.
+        let chunk = if let Some(sender) = cache.get(&channel_id) {
+            match sender.try_send(chunk) {
+                Ok(_) => return Ok(()),
+                Err(TrySendError::Full(chunk)) => {
+                    return Err(ForwardChunkError::RecvBufferFull(chunk))
+                }
+                Err(TrySendError::Disconnected(chunk)) => {
+                    cache.remove(&channel_id);
+                    chunk
+                }
+            }
+        } else {
+            chunk
+        };
 
-        loop {
-            match socket.receive_chunk() {
+        if let Some(sender) = self.channels.get(&channel_id) {
+            match sender.try_send(chunk) {
+                Ok(_) => {
+                    cache.insert(channel_id, sender.clone());
+                    Ok(())
+                }
+                Err(TrySendError::Full(chunk)) => {
+                    return Err(ForwardChunkError::RecvBufferFull(chunk))
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    unreachable!();
+                }
+            }
+        } else {
+            return Err(ForwardChunkError::Disconnected(chunk));
+        }
+    }
+
+    fn receiver_thread<F: Callback>(
+        receiver_socket: Arc<MultiplexSocket>,
+        sender_socket: Arc<MultiplexSocket>,
+        callback: F,
+    ) {
+        // Caches the channels for faster lookup.
+        let mut channel_cache = HashMap::default();
+
+        // If we hold the only strong reference to the socket, we can exit the loop and
+        // drop the socket.
+        let exit = if Arc::ptr_eq(&receiver_socket, &sender_socket) {
+            Arc::strong_count(&receiver_socket) <= 2
+        } else {
+            Arc::strong_count(&receiver_socket) <= 1
+        };
+
+        while !exit {
+            match receiver_socket.inner.receive_chunk() {
                 Ok(chunk) => match chunk.validate() {
                     Ok(c) => {
+                        log::trace!(
+                            "received chunk: {:?} from {}",
+                            c,
+                            display_addr(chunk.addr())
+                        );
                         if let Some(channel_id) = c.channel_id() {
-                            if let Err(err) = channel_connections.send(channel_id, chunk) {
-                                log::error!("failed to forward join channel: {}", err);
+                            let ack = c.requires_ack().map(|c| (c, chunk.addr().clone()));
+
+                            match receiver_socket.forward_chunk(
+                                channel_id.into(),
+                                chunk,
+                                &mut channel_cache,
+                            ) {
+                                Ok(_) => {
+                                    if let Some((ack, addr)) = ack {
+                                        log::trace!(
+                                            "sending ack({ack}) for channel {channel_id} to {}",
+                                            display_addr(&addr)
+                                        );
+
+                                        if let Err(err) = sender_socket.send_chunk_to(
+                                            &protocol::GroupAck {
+                                                group_id: channel_id.into(),
+                                                seq: ack,
+                                            },
+                                            &addr,
+                                        ) {
+                                            log::error!("failed to send ack: {}", err);
+                                        }
+                                    }
+                                }
+                                Err(ForwardChunkError::RecvBufferFull(chunk)) => {
+                                    log::warn!(
+                                        "channel {} is full, dropping chunk: {:?}",
+                                        channel_id,
+                                        chunk
+                                    );
+                                }
+                                Err(ForwardChunkError::Disconnected(chunk)) => {
+                                    receiver_socket
+                                        .send_chunk_to(
+                                            &GroupDisconnected(channel_id),
+                                            chunk.addr(),
+                                        )
+                                        .ok();
+                                    log::warn!(
+                                        "channel {} is disconnected, dropping chunk",
+                                        channel_id
+                                    );
+                                }
                             }
                         } else {
-                            process_unchannelled_chunk(&socket, chunk)
+                            callback(
+                                &receiver_socket,
+                                CallbackReason::UnhandledChunk {
+                                    chunk: c,
+                                    addr: chunk.addr(),
+                                },
+                            );
                         }
                     }
                     Err(err) => log::error!("received invalid chunk: {}", err),
                 },
-                Err(err) => {
-                    log::error!("failed to read from socket: {}", err);
-                }
+                Err(err) => match err.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        callback(&receiver_socket, CallbackReason::Timeout);
+                    }
+                    _ => {
+                        log::error!("failed to read from socket: {}", err);
+                    }
+                },
             }
         }
     }
 
-    fn spawn_receiver_thread<F: Fn(&ChunkSocket, ReceivedChunk) + Send + 'static>(
-        socket: ChunkSocket,
-        channel_sender_receiver: ChannelListenerReceiver,
-        process_unchannelled_chunk: F,
+    fn spawn_receiver_thread<F: Callback>(
+        receiver_socket: Arc<MultiplexSocket>,
+        sender_socket: Arc<MultiplexSocket>,
+        callback: F,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            Self::receiver_thread(socket, channel_sender_receiver, process_unchannelled_chunk);
+            Self::receiver_thread(receiver_socket, sender_socket, callback);
         })
     }
 
-    fn ignore_unchannelled_chunk(_: &ChunkSocket, c: ReceivedChunk) {
-        log::debug!("ignoring unchannelled chunk: {:?}", c);
+    pub fn new(socket: Socket, buffer_allocator: Arc<ChunkBufferAllocator>) -> Arc<Self> {
+        Self::with_callback(socket, buffer_allocator, |_, _| {})
     }
 
-    pub fn new(
+    pub fn with_sender_socket(socket: Socket, sender_socket: Arc<MultiplexSocket>) -> Arc<Self> {
+        let result = Arc::new(Self {
+            inner: ChunkSocket::new(Arc::new(socket), sender_socket.inner.buffer_allocator().clone()),
+            channels: DashMap::default(),
+        });
+
+        Self::spawn_receiver_thread(result.clone(), sender_socket, |_, _| {});
+
+        result
+    }
+
+    pub fn with_callback<F: Callback>(
         socket: Socket,
         buffer_allocator: Arc<ChunkBufferAllocator>,
-    ) -> Result<Self, std::io::Error> {
-        Self::with_unchannelled_handler(socket, buffer_allocator, Self::ignore_unchannelled_chunk)
+        callback: F,
+    ) -> Arc<Self> {
+        let result = Arc::new(Self {
+            inner: ChunkSocket::new(Arc::new(socket), buffer_allocator),
+            channels: DashMap::default(),
+        });
+
+        Self::spawn_receiver_thread(result.clone(), result.clone(), callback);
+
+        result
     }
 
-    pub fn with_unchannelled_handler<F: Fn(&ChunkSocket, ReceivedChunk) + Send + 'static>(
+    pub fn with_callback_and_sender_socket<F: Callback>(
         socket: Socket,
+        sender_socket: Arc<MultiplexSocket>,
         buffer_allocator: Arc<ChunkBufferAllocator>,
-        process_unchannelled_chunk: F,
-    ) -> Result<Self, std::io::Error> {
-        let (channel_sender, channel_receiver) = crossbeam::channel::unbounded();
+        callback: F,
+    ) -> Arc<Self> {
+        let result = Arc::new(Self {
+            inner: ChunkSocket::new(Arc::new(socket), buffer_allocator),
+            channels: DashMap::default(),
+        });
 
-        Self::spawn_receiver_thread(
-            ChunkSocket::new(socket.try_clone().unwrap(), buffer_allocator.clone()),
-            channel_receiver,
-            process_unchannelled_chunk,
-        );
+        Self::spawn_receiver_thread(result.clone(), sender_socket, callback);
 
-        Ok(Self {
-            socket: ChunkSocket::new(socket, buffer_allocator),
-            channel_sender,
-        })
+        result
     }
 
-    pub fn send_chunk<T: ChunkKindData>(&self, kind_data: &T) -> Result<(), std::io::Error> {
-        self.socket.send_chunk(kind_data)
+    #[inline]
+    pub fn buffer_allocator(&self) -> &Arc<ChunkBufferAllocator> {
+        self.inner.buffer_allocator()
     }
 
-    pub fn send_chunk_with_payload<T: ChunkKindData>(
+    #[inline]
+    pub fn send_chunk_buffer_to(
+        &self,
+        buffer: &ChunkBuffer,
+        packet_size: usize,
+        addr: &SockAddr,
+    ) -> Result<(), std::io::Error> {
+        self.inner.send_chunk_buffer_to(buffer, packet_size, addr)
+    }
+
+    #[inline]
+    pub fn send_chunk<T: ChunkHeader>(&self, kind_data: &T) -> Result<(), std::io::Error> {
+        self.inner.send_chunk(kind_data)
+    }
+
+    #[inline]
+    pub fn send_chunk_to<T: ChunkHeader>(
+        &self,
+        kind_data: &T,
+        addr: &SockAddr,
+    ) -> Result<(), std::io::Error> {
+        self.inner.send_chunk_to(kind_data, addr)
+    }
+
+    #[inline]
+    pub fn send_chunk_with_payload<T: ChunkHeader>(
         &self,
         kind_data: &T,
         payload: &[u8],
     ) -> Result<(), std::io::Error> {
-        self.socket.send_chunk_with_payload(kind_data, payload)
+        self.inner.send_chunk_with_payload(kind_data, payload)
     }
 
-    /// Registers a channel listener for the given channel id.
-    ///
-    /// Any previous listener for the same channel id is replaced.
-    pub fn listen_to_channel(&self, channel_id: ChannelId) -> ChunkReceiver {
-        let (sender, receiver) = crossbeam::channel::unbounded();
-        if self.channel_sender.send((channel_id, sender)).is_err() {
-            // The channel cannot be disconnected as the receiver thread which holds the receiver
-            // only exits when the client is dropped.
-            unreachable!();
-        }
-        receiver
+    #[inline]
+    pub fn send_chunk_with_payload_to<T: ChunkHeader>(
+        &self,
+        kind_data: &T,
+        payload: &[u8],
+        addr: &SockAddr,
+    ) -> Result<(), std::io::Error> {
+        self.inner
+            .send_chunk_with_payload_to(kind_data, payload, addr)
     }
 
-    pub fn socket(&self) -> &ChunkSocket {
-        &self.socket
+    pub fn allocate_channel(
+        self: &Arc<Self>,
+        channel_id: protocol::GroupId,
+        receive_capacity: Option<NonZeroUsize>,
+    ) -> Option<Channel> {
+        let mut result = None;
+
+        self.channels.entry(channel_id).or_insert_with(|| {
+            let (sender, receiver) = if let Some(capacity) = receive_capacity {
+                crossbeam::channel::bounded(capacity.get())
+            } else {
+                crossbeam::channel::unbounded()
+            };
+            result = Some(receiver);
+            sender
+        });
+
+        result.map(|receiver| Channel {
+            receiver,
+            channel_id,
+            socket: self.clone(),
+        })
     }
 }
 
@@ -228,7 +539,7 @@ pub enum TransmitAndWaitError {
     SendError(#[from] std::io::Error),
 }
 
-pub fn transmit_and_wait<C: ChunkKindData, T, P: FnMut(Chunk, SocketAddr) -> Option<T>>(
+pub fn transmit_and_wait<C: ChunkHeader, T, P: FnMut(Chunk, SocketAddr) -> Option<T>>(
     socket: &ChunkSocket,
     kind_data: &C,
     retransmit_timeout: std::time::Duration,
@@ -253,7 +564,7 @@ pub fn transmit_and_wait<C: ChunkKindData, T, P: FnMut(Chunk, SocketAddr) -> Opt
     Err(TransmitAndWaitError::RecvError(RecvTimeoutError::Timeout))
 }
 
-pub fn transmit_to_and_wait<T: ChunkKindData, P: FnMut(Chunk, SocketAddr) -> bool>(
+pub fn transmit_to_and_wait<T: ChunkHeader, P: FnMut(Chunk, SocketAddr) -> bool>(
     socket: &ChunkSocket,
     addr: &SocketAddr,
     kind_data: &T,

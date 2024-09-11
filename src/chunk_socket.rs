@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::{io::IoSlice, sync::Arc};
 
 use socket2::{SockAddr, Socket};
 
 use crate::{
     chunk::{Chunk, ChunkBuffer, ChunkBufferAllocator, ChunkValidationError},
-    protocol::ChunkKindData,
+    protocol::ChunkHeader,
 };
 
 #[derive(Debug)]
@@ -41,17 +41,24 @@ impl ReceivedChunk {
 }
 
 /// A socket that sends and receives chunks.
+#[derive(Debug, Clone)]
 pub struct ChunkSocket {
-    socket: Socket,
+    socket: Arc<Socket>,
     buffer_allocator: Arc<ChunkBufferAllocator>,
+    chunk_size: usize,
 }
 
 impl ChunkSocket {
-    pub fn new(socket: Socket, buffer_allocator: Arc<ChunkBufferAllocator>) -> Self {
+    pub fn new(socket: Arc<Socket>, buffer_allocator: Arc<ChunkBufferAllocator>) -> Self {
         Self {
             socket,
+            chunk_size: buffer_allocator.chunk_size(),
             buffer_allocator,
         }
+    }
+
+    pub fn buffer_allocator(&self) -> &Arc<ChunkBufferAllocator> {
+        &self.buffer_allocator
     }
 
     pub fn receive_chunk(&self) -> Result<ReceivedChunk, std::io::Error> {
@@ -68,86 +75,119 @@ impl ChunkSocket {
         Ok(ReceivedChunk::new(buffer, addr, size))
     }
 
+    #[inline]
     pub fn send_chunk_buffer(
         &self,
         buffer: &ChunkBuffer,
         packet_size: usize,
     ) -> Result<(), std::io::Error> {
-        self.socket.send(&buffer[..packet_size])?;
+        let sent_bytes = self.socket.send(&buffer[..packet_size])?;
+        debug_assert_eq!(sent_bytes, packet_size);
         Ok(())
     }
 
+    #[inline]
     pub fn send_chunk_buffer_to(
         &self,
         buffer: &ChunkBuffer,
         packet_size: usize,
         addr: &SockAddr,
     ) -> Result<(), std::io::Error> {
-        self.socket.send_to(&buffer[..packet_size], addr)?;
+        let sent_bytes = self.socket.send_to(&buffer[..packet_size], addr)?;
+        debug_assert_eq!(sent_bytes, packet_size);
         Ok(())
     }
 
-    pub fn send_chunk<T: ChunkKindData>(&self, kind_data: &T) -> Result<(), std::io::Error> {
-        let mut buffer = self.buffer_allocator.allocate();
-        buffer.init(kind_data);
-        let size = 1 + std::mem::size_of::<T>();
-        self.send_chunk_buffer(&buffer, size)?;
+    pub fn send_chunk<T: ChunkHeader>(&self, kind_data: &T) -> Result<(), std::io::Error> {
+        let data_size = 1 + std::mem::size_of::<T>();
+        debug_assert!(data_size <= self.chunk_size);
+
+        let kind_id = T::id();
+        let kind_id_buf = [kind_id];
+        let bufs = [
+            IoSlice::new(&kind_id_buf),
+            IoSlice::new(kind_data.as_bytes()),
+        ];
+
+        let sent_bytes = self.socket.send_vectored(&bufs)?;
+        debug_assert_eq!(sent_bytes, data_size);
+
         Ok(())
     }
 
-    pub fn send_chunk_to<T: ChunkKindData>(
+    pub fn send_chunk_to<T: ChunkHeader>(
         &self,
         kind_data: &T,
         addr: &SockAddr,
     ) -> Result<(), std::io::Error> {
-        let mut buffer = self.buffer_allocator.allocate();
-        buffer.init(kind_data);
-        let size = 1 + std::mem::size_of::<T>();
-        self.send_chunk_buffer_to(&buffer, size, addr)?;
+        let data_size = 1 + std::mem::size_of::<T>();
+        debug_assert!(data_size <= self.chunk_size);
+
+        let kind_id = T::id();
+        let kind_id_buf = [kind_id];
+        let bufs = [
+            IoSlice::new(&kind_id_buf),
+            IoSlice::new(kind_data.as_bytes()),
+        ];
+
+        let sent_bytes = self.socket.send_to_vectored(&bufs, addr)?;
+        debug_assert_eq!(sent_bytes, data_size);
+
         Ok(())
     }
 
-    pub fn send_chunk_with_payload<T: ChunkKindData>(
+    pub fn send_chunk_with_payload<T: ChunkHeader>(
         &self,
         kind_data: &T,
         payload: &[u8],
     ) -> Result<(), std::io::Error> {
-        let mut buffer = self.buffer_allocator.allocate();
-        buffer.init(kind_data);
-        let size = 1 + std::mem::size_of::<T>() + payload.len();
-        if size > buffer.len() {
+        let data_size = 1 + std::mem::size_of::<T>() + payload.len();
+        if data_size > self.chunk_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "payload too large",
             ));
         }
-        self.send_chunk_buffer(&buffer, size)?;
+
+        let kind_id = T::id();
+        let kind_id_buf = [kind_id];
+        let bufs = [
+            IoSlice::new(&kind_id_buf),
+            IoSlice::new(kind_data.as_bytes()),
+            IoSlice::new(payload),
+        ];
+
+        let sent_bytes = self.socket.send_vectored(&bufs)?;
+        debug_assert_eq!(sent_bytes, data_size);
+
         Ok(())
     }
 
-    pub fn send_chunk_with_payload_to<T: ChunkKindData>(
+    pub fn send_chunk_with_payload_to<T: ChunkHeader>(
         &self,
         kind_data: &T,
         payload: &[u8],
         addr: &SockAddr,
     ) -> Result<(), std::io::Error> {
-        let mut buffer = self.buffer_allocator.allocate();
-        buffer.init_with_payload(kind_data, payload);
-        let size = 1 + std::mem::size_of::<T>() + payload.len();
-        if size > buffer.len() {
+        let data_size = 1 + std::mem::size_of::<T>() + payload.len();
+        if data_size > self.chunk_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "payload too large",
             ));
         }
-        self.send_chunk_buffer_to(&buffer, size, addr)?;
-        Ok(())
-    }
 
-    pub fn try_clone(&self) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            socket: self.socket.try_clone()?,
-            buffer_allocator: self.buffer_allocator.clone(),
-        })
+        let kind_id = T::id();
+        let kind_id_buf = [kind_id];
+        let bufs = [
+            IoSlice::new(&kind_id_buf),
+            IoSlice::new(kind_data.as_bytes()),
+            IoSlice::new(payload),
+        ];
+
+        let sent_bytes = self.socket.send_to_vectored(&bufs, addr)?;
+        debug_assert_eq!(sent_bytes, data_size);
+
+        Ok(())
     }
 }
