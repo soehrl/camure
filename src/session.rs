@@ -445,6 +445,9 @@ impl Member {
     /// The `addr` parameter corresponds to the `bind_addr` parameter of
     /// [`Coordinator::start_session`].
     pub fn join_session(addr: SocketAddr) -> Result<Self, JoinSessionError> {
+        let join_session_span = tracing::trace_span!("join_session", addr = %addr);
+        let _join_session_span_guard = join_session_span.enter();
+
         let coordinator_socket =
             Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
                 .map_err(JoinSessionError::SocketCreateError)?;
@@ -509,10 +512,13 @@ impl Member {
             buffer_allocator.clone(),
             move |socket, reason| match reason {
                 CallbackReason::Timeout => {
-                    log::trace!("sending heartbeat to coordinator");
                     // We ran into a timeout, which is set to the heartbeat interval
-                    // TODO: what to do in case of an error?
-                    let _ = socket.send_chunk_to(&SessionHeartbeat, &coordinator_address_copy);
+                    if let Err(err) = socket.send_chunk_to(&SessionHeartbeat, &coordinator_address_copy) {
+                        tracing::error!(%err, "failed to send heartbeat");
+                        todo!("handle error");
+                    } else {
+                        tracing::trace!("sent heartbeat");
+                    }
                 }
                 _ => {}
             },

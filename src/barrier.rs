@@ -46,15 +46,25 @@ impl GroupCoordinatorTypeImpl for BarrierGroupCoordinatorState {
             | Chunk::GroupWelcome(_)
             | Chunk::GroupLeave(_)
             | Chunk::GroupDisconnected(_) => {
+                // These chunks cannot be forwared to this function, as they should have been
+                // filtered out by either the multiplex socket or the GroupCoordinator.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received invalid chunk in barrier group",
+                );
                 unreachable!();
             }
             Chunk::BroadcastMessage(_)
             | Chunk::BroadcastFirstMessageFragment(_)
             | Chunk::BroadcastMessageFragment(_)
             | Chunk::BroadcastFinalMessageFragment(_) => {
-                log::trace!(
-                    "IGNORED: broadcast message from {} received in barrier group",
-                    display_addr(addr)
+                // These chunks could be forwarded to this function, but they would never been
+                // send by this crate.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received broadcast message in barrier group",
                 );
             }
             Chunk::GroupAck(ack) => {
@@ -62,24 +72,24 @@ impl GroupCoordinatorTypeImpl for BarrierGroupCoordinatorState {
                     if group.members.contains(addr) || group.member_requests.contains(addr) {
                         self.ack_required.remove(addr);
 
-                        log::trace!(
-                            "received ack from {} with seq {}",
-                            display_addr(addr),
-                            ack.seq,
+                        tracing::trace!(
+                            from = %display_addr(addr),
+                            seq = <_ as Into<u16>>::into(ack.seq),
+                            "received ack",
                         );
                     } else {
-                        log::trace!(
-                            "IGNORED: received ack from non-member {} with seq {}",
-                            display_addr(addr),
-                            ack.seq,
+                        tracing::warn!(
+                            from = %display_addr(addr),
+                            seq = <_ as Into<u16>>::into(ack.seq),
+                            "received ack from non-group-member",
                         );
                     }
                 } else {
-                    log::trace!(
-                        "IGNORED: received ack from {} with unexpected seq {} (expected seq: {})",
-                        display_addr(addr),
-                        ack.seq,
-                        group.seq.prev(),
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(ack.seq),
+                        expected_seq = <_ as Into<u16>>::into(group.seq.prev()),
+                        "received ack with unexpected seq",
                     );
                 }
             }
@@ -88,32 +98,34 @@ impl GroupCoordinatorTypeImpl for BarrierGroupCoordinatorState {
                     if group.members.contains(addr) || group.member_requests.contains(addr) {
                         self.arrived.insert(addr.clone());
 
-                        log::trace!(
-                            "received barrier reached from {} with seq {}",
-                            display_addr(addr),
-                            reached.seq,
+                        tracing::trace!(
+                            from = %display_addr(addr),
+                            seq = <_ as Into<u16>>::into(reached.seq),
+                            "received barrier-reached",
                         );
                     } else {
-                        log::trace!(
-                            "IGNORED: received barrier reached from non-member {} with seq {}",
-                            display_addr(addr),
-                            reached.seq,
+                        tracing::warn!(
+                            from = %display_addr(addr),
+                            seq = <_ as Into<u16>>::into(reached.seq),
+                            "received barrier-reached from non-group-member",
                         );
                     }
                 } else {
-                    log::trace!(
-                        "IGNORED: received barrier reached from {} with non-current seq {} (current seq: {})",
-                        display_addr(addr),
-                        reached.seq,
-                        group.seq,
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(reached.seq),
+                        expected_seq = <_ as Into<u16>>::into(group.seq),
+                        "received barrier-reached with unexpected seq",
                     );
                 }
             }
-            Chunk::BarrierReleased(released) => log::trace!(
-                "IGNORED: received barrier released from {} with seq {}",
-                display_addr(addr),
-                released.seq,
-            ),
+            Chunk::BarrierReleased(released) => {
+                tracing::error!(
+                    from = %display_addr(addr),
+                    seq = <_ as Into<u16>>::into(released.seq),
+                    "received barrier-released",
+                );
+            }
         }
     }
 
@@ -146,10 +158,12 @@ impl BarrierGroupCoordinator {
         !self.group.state.members.is_empty()
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn accept(&mut self) -> std::io::Result<SocketAddr> {
         self.group.accept().and_then(sock_addr_to_socket_addr)
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn try_accept(&mut self) -> std::io::Result<Option<SocketAddr>> {
         let addr = self.group.try_accept()?;
         if let Some(addr) = addr {
@@ -159,19 +173,8 @@ impl BarrierGroupCoordinator {
         }
     }
 
-    pub fn wait(&mut self) -> std::io::Result<()> {
-        if self.group.state.members.is_empty() {
-            log::trace!("wait: no members in group");
-            return Ok(());
-        }
-
-        // Wait until everyone has arrived
-        log::trace!("waiting for all members to arrive");
-        if !self.all_members_arrived() {
-            self.group.recv()?;
-        }
-        log::trace!("all members have arrived");
-
+    #[tracing::instrument(skip(self))]
+    fn release_barrier(&mut self) -> std::io::Result<()> {
         let release_seq = self.group.state.seq;
         self.group.state.seq = self.group.state.seq.next();
 
@@ -180,24 +183,20 @@ impl BarrierGroupCoordinator {
 
         // Send barrier released and wait for acks
         for deadline in ExponentialBackoff::new() {
-            log::trace!("sending barrier released with seq {}", release_seq);
+            let send_barrier_released_span = tracing::trace_span!("send barrier released");
+            let _send_barrier_released_span_guard = send_barrier_released_span.enter();
+
             self.group.send_chunk_to_group(&BarrierReleased {
                 seq: release_seq,
                 group_id: self.group.channel.id(),
             })?;
-            log::trace!("waiting for acks");
 
             loop {
                 match self.group.recv_until(deadline) {
                     Ok(_) => {
                         if self.group.inner.ack_required.is_empty() {
-                            log::trace!("all members have acknowledged the barrier release");
+                            tracing::trace!("all acks received");
                             return Ok(());
-                        } else {
-                            log::trace!(
-                                "still waiting for acks from {:?}",
-                                self.group.inner.ack_required.iter().map(display_addr),
-                            );
                         }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::TimedOut => break,
@@ -206,20 +205,45 @@ impl BarrierGroupCoordinator {
             }
 
             let mut members_to_remove = HashSet::default();
-            log::trace!("still wating for:");
+            tracing::trace!(
+                missing_acks_from = ?self.group.inner.ack_required.iter().map(display_addr),
+                "timout while waiting for ack",
+            );
             for addr in &self.group.inner.ack_required {
                 if !self.group.session_members.is_alive(addr) {
                     members_to_remove.insert(addr.clone());
-                    log::trace!("{}: dead", display_addr(addr));
-                } else {
-                    log::trace!("{}: still alive", display_addr(addr));
                 }
             }
+
+            tracing::trace!(
+                disconnected_members = ?members_to_remove.iter().map(display_addr),
+                "removing disconnected members",
+            );
             for addr in members_to_remove {
                 self.group.remove(&addr)?;
             }
         }
         unreachable!();
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn wait(&mut self) -> std::io::Result<()> {
+        if self.group.state.members.is_empty() {
+            tracing::trace!("no members in group");
+            return Ok(());
+        }
+
+        // Wait until everyone has arrived
+        tracing::trace_span!("waiting for all members to arrive").in_scope(
+            || -> std::io::Result<()> {
+                while !self.all_members_arrived() {
+                    self.group.recv()?;
+                }
+                Ok(())
+            },
+        )?;
+
+        self.release_barrier()
     }
 }
 
@@ -248,57 +272,76 @@ impl GroupMemberTypeImpl for BarrierGroupMemberState {
             | Chunk::GroupWelcome(_)
             | Chunk::GroupLeave(_)
             | Chunk::GroupDisconnected(_) => {
+                // These chunks cannot be forwared to this function, as they should have been
+                // filtered out by either the multiplex socket or the GroupCoordinator.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received invalid chunk in barrier group",
+                );
                 unreachable!();
             }
             Chunk::BroadcastMessage(_)
             | Chunk::BroadcastFirstMessageFragment(_)
             | Chunk::BroadcastMessageFragment(_)
             | Chunk::BroadcastFinalMessageFragment(_) => {
-                log::trace!(
-                    "IGNORED: broadcast message from {} received in barrier group",
-                    display_addr(addr)
+                // These chunks could be forwarded to this function, but they would never been
+                // send by this crate.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received broadcast message in barrier group",
                 );
             }
-            Chunk::BarrierReached(reached) => log::trace!(
-                "IGNORED: received barrier released from {} with seq {}",
-                display_addr(addr),
-                reached.seq,
-            ),
+            Chunk::BarrierReached(reached) => {
+                tracing::error!(
+                    from = %display_addr(addr),
+                    seq = <_ as Into<u16>>::into(reached.seq),
+                    "received barrier-reached",
+                );
+            }
             Chunk::GroupAck(ack) => {
                 if ack.seq == self.next {
-                    log::trace!(
-                        "received ack from {} with seq {}",
-                        display_addr(addr),
-                        ack.seq,
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(ack.seq),
+                        "received ack for barrier-reached",
                     );
                     self.next = self.next.next();
                 } else {
-                    log::trace!(
-                        "IGNORED: received ack from {} with seq {} (expected seq: {})",
-                        display_addr(addr),
-                        ack.seq,
-                        self.next,
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(ack.seq),
+                        expected_seq = <_ as Into<u16>>::into(self.next),
+                        "received ack for barrier-reached with unexpected seq",
                     );
                 }
             }
             Chunk::BarrierReleased(released) => {
                 if released.seq == self.released.next() {
-                    log::trace!(
-                        "received barrier released from {} with seq {}",
-                        display_addr(addr),
-                        released.seq,
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(released.seq),
+                        "received barrier-released",
                     );
                     self.released = released.seq;
                 } else {
-                    log::trace!(
-                        "IGNORED: received barrier released from {} with unexpected seq {} (expected seq {})",
-                        display_addr(addr),
-                        released.seq,
-                        self.released.next(),
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(released.seq),
+                        expected_seq = <_ as Into<u16>>::into(self.released.next()),
+                        "received barrier-released with unexpected seq",
                     );
                 }
                 if self.next == self.released {
-                    log::trace!("reached ack from server got lost for seq {}", self.next);
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(released.seq),
+                        next = <_ as Into<u16>>::into(self.next),
+                        released = <_ as Into<u16>>::into(self.released),
+                        "ack for barrier-reached got lost",
+                    );
+
                     self.next = self.next.next();
                 }
             }
@@ -339,6 +382,7 @@ impl BarrierGroupMember {
         unreachable!();
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn wait(&mut self) -> std::io::Result<()> {
         let reached = self.send_reached()?;
 

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
 
 use ahash::HashMap;
 use crossbeam::channel::{Receiver, RecvTimeoutError, Select, Sender, TryRecvError, TrySendError};
@@ -25,15 +25,6 @@ pub enum CallbackReason<'a> {
 
 pub trait Callback: Fn(&MultiplexSocket, CallbackReason) + Send + 'static {}
 impl<F: Fn(&MultiplexSocket, CallbackReason) + Send + 'static> Callback for F {}
-
-// #[derive(thiserror::Error, Debug)]
-// pub enum SendError {
-//     #[error("I/O error: {0}")]
-//     Io(#[from] std::io::Error),
-
-//     #[error("buffer is not a valid chunk")]
-//     InvalidChunk,
-// }
 
 #[derive(thiserror::Error, Debug)]
 enum ForwardChunkError {
@@ -274,11 +265,12 @@ impl MultiplexSocket {
             match receiver_socket.inner.receive_chunk() {
                 Ok(chunk) => match chunk.validate() {
                     Ok(c) => {
-                        log::trace!(
-                            "received chunk: {:?} from {}",
-                            c,
-                            display_addr(chunk.addr())
-                        );
+                        let _ = tracing::trace_span!(
+                            "handle chunk",
+                            from = %display_addr(chunk.addr()),
+                            ?chunk,
+                        ).enter();
+
                         if let Some(channel_id) = c.channel_id() {
                             let ack = c.requires_ack().map(|c| (c, chunk.addr().clone()));
 
@@ -289,11 +281,6 @@ impl MultiplexSocket {
                             ) {
                                 Ok(_) => {
                                     if let Some((ack, addr)) = ack {
-                                        log::trace!(
-                                            "sending ack({ack}) for channel {channel_id} to {}",
-                                            display_addr(&addr)
-                                        );
-
                                         if let Err(err) = sender_socket.send_chunk_to(
                                             &protocol::GroupAck {
                                                 group_id: channel_id.into(),
@@ -301,28 +288,54 @@ impl MultiplexSocket {
                                             },
                                             &addr,
                                         ) {
-                                            log::error!("failed to send ack: {}", err);
+                                            tracing::error!(
+                                                %ack,
+                                                %channel_id,
+                                                %err,
+                                                to = %display_addr(&addr),
+                                                "failed to send ack"
+                                            );
+                                            todo!("close connection");
+                                        } else {
+                                            tracing::trace!(
+                                                %ack,
+                                                %channel_id,
+                                                to = %display_addr(&addr),
+                                                "send ack"
+                                            );
                                         }
                                     }
                                 }
                                 Err(ForwardChunkError::RecvBufferFull(chunk)) => {
-                                    log::warn!(
-                                        "channel {} is full, dropping chunk: {:?}",
-                                        channel_id,
-                                        chunk
+                                    tracing::warn!(
+                                        %channel_id,
+                                        ?chunk,
+                                        "chunk dropped due to full channel buffer"
                                     );
                                 }
                                 Err(ForwardChunkError::Disconnected(chunk)) => {
-                                    receiver_socket
-                                        .send_chunk_to(
-                                            &GroupDisconnected(channel_id),
-                                            chunk.addr(),
-                                        )
-                                        .ok();
-                                    log::warn!(
-                                        "channel {} is disconnected, dropping chunk",
-                                        channel_id
+                                    tracing::warn!(
+                                        %channel_id,
+                                        ?chunk,
+                                        "chunk dropped due to disconnected channel"
                                     );
+                                    if let Err(err) = receiver_socket
+                                        .send_chunk_to(&GroupDisconnected(channel_id), chunk.addr())
+                                    {
+                                        tracing::error!(
+                                            %channel_id,
+                                            to = %display_addr(&chunk.addr()),
+                                            err = %err,
+                                            "failed to send group disconnect message"
+                                        );
+                                        todo!("close connection");
+                                    } else {
+                                        tracing::trace!(
+                                            %channel_id,
+                                            to = %display_addr(&chunk.addr()),
+                                            "sent group disconnect message"
+                                        );
+                                    }
                                 }
                             }
                         } else {
@@ -335,14 +348,19 @@ impl MultiplexSocket {
                             );
                         }
                     }
-                    Err(err) => log::error!("received invalid chunk: {}", err),
+                    Err(err) => {
+                        tracing::error!(chunk = ?chunk, err = %err, "received invalid chunk")
+                    }
                 },
                 Err(err) => match err.kind() {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                        callback(&receiver_socket, CallbackReason::Timeout);
+                        tracing::trace_span!("timeout").in_scope(|| {
+                            callback(&receiver_socket, CallbackReason::Timeout);
+                        });
                     }
                     _ => {
-                        log::error!("failed to read from socket: {}", err);
+                        tracing::error!("failed to read from socket: {}", err);
+                        todo!("close connection");
                     }
                 },
             }
@@ -365,7 +383,10 @@ impl MultiplexSocket {
 
     pub fn with_sender_socket(socket: Socket, sender_socket: Arc<MultiplexSocket>) -> Arc<Self> {
         let result = Arc::new(Self {
-            inner: ChunkSocket::new(Arc::new(socket), sender_socket.inner.buffer_allocator().clone()),
+            inner: ChunkSocket::new(
+                Arc::new(socket),
+                sender_socket.inner.buffer_allocator().clone(),
+            ),
             channels: DashMap::default(),
         });
 

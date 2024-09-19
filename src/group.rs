@@ -102,27 +102,12 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
         self.channel.buffer_allocator()
     }
 
-    pub fn accept(&mut self) -> Result<SockAddr, std::io::Error> {
-        let addr = loop {
-            if let Some(addr) = self.state.get_request() {
-                break addr.clone();
-            } else {
-                self.recv()?;
-            }
-        };
-
-        log::trace!(
-            "accept group join request for group {} from {}",
-            self.channel.id(),
-            display_addr(&addr),
-        );
-
+    #[tracing::instrument(skip(self))]
+    fn accept_member(&mut self, addr: &SockAddr) -> std::io::Result<()> {
         'outer: for deadline in ExponentialBackoff::new() {
-            log::trace!(
-                "send group welcome for group {} to {}",
-                self.channel.id(),
-                display_addr(&addr),
-            );
+            let send_welcome_span = tracing::trace_span!("send group welcome");
+            let _send_group_welcome_guard = send_welcome_span.enter();
+
             self.channel.send_chunk_to(
                 &GroupWelcome {
                     group_id: self.channel.id(),
@@ -133,9 +118,9 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
 
             while !self.state.members.contains(&addr) {
                 if !self.session_members.is_alive(&addr) {
-                    log::trace!(
-                        "member {} is not alive anymore, ignore join request",
-                        display_addr(&addr),
+                    tracing::trace!(
+                        addr = %display_addr(&addr),
+                        "member is not alive anymore, ignore join request",
                     );
                     self.state.member_requests.remove(&addr);
                     self.inner.process_join_cancelled(&addr, &self.state);
@@ -153,19 +138,27 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
                 }
             }
 
-            log::trace!(
-                "join group({}) for {} was successful",
-                self.channel.id(),
-                display_addr(&addr),
-            );
-
+            tracing::trace!("success");
             debug_assert!(self.state.members.contains(&addr));
             self.state.member_requests.remove(&addr);
             self.inner.process_member_joined(&addr, &self.state);
-            return Ok(addr);
+            return Ok(());
         }
 
         unreachable!();
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn accept(&mut self) -> Result<SockAddr, std::io::Error> {
+        let addr = loop {
+            if let Some(addr) = self.state.get_request() {
+                break addr.clone();
+            } else {
+                self.recv()?;
+            }
+        };
+
+        self.accept_member(&addr).map(|_| addr)
     }
 
     pub fn try_accept(&mut self) -> Result<Option<SockAddr>, std::io::Error> {
@@ -189,17 +182,12 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     fn process_join(&mut self, join: &GroupJoin, addr: &SockAddr) {
         debug_assert_eq!(
             self.channel.id(),
             join.group_id,
             "this is enforced by the socket"
-        );
-
-        log::trace!(
-            "received group join for group {} from {}",
-            self.channel.id(),
-            display_addr(addr),
         );
 
         if I::GROUP_TYPE != join.group_type {
@@ -236,22 +224,24 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
         self.inner.process_join_request(addr, &self.state);
     }
 
+    #[tracing::instrument(skip(self))]
     fn process_ack(&mut self, ack: &GroupAck, addr: &SockAddr) {
         if self.state.member_requests.contains(addr) {
             if ack.seq == self.state.seq {
-                log::trace!(
-                    "received ack for group welcome {} from {}",
-                    self.channel.id(),
-                    display_addr(addr),
+                tracing::trace!(
+                    channel_id = <_ as Into<u16>>::into(self.channel.id()),
+                    addr = %display_addr(addr),
+                    seq = <_ as Into<u16>>::into(ack.seq),
+                    "received ack for welcome group message",
                 );
                 self.state.members.insert(addr.clone());
             } else {
-                log::trace!(
-                    "INGORED: received ack for group welcome {} from {} with invalid seq {} (expected {})",
-                    self.channel.id(),
-                    display_addr(addr),
-                    ack.seq,
-                    self.state.seq,
+                tracing::warn!(
+                    channel_id = <_ as Into<u16>>::into(self.channel.id()),
+                    addr = %display_addr(addr),
+                    seq = <_ as Into<u16>>::into(ack.seq),
+                    expected_seq = <_ as Into<u16>>::into(self.state.seq),
+                    "received ack for welcome group message with invalid seq",
                 );
             }
         } else {
@@ -302,11 +292,13 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
             Chunk::SessionWelcome(_) => unreachable!("received session welcome in channel"),
             Chunk::SessionHeartbeat(_) => unreachable!("received session heartbeat in channel"),
             Chunk::GroupJoin(join) => self.process_join(join, &addr),
-            Chunk::GroupWelcome(welcome) => log::trace!(
-                "coordinator received channel welcome from {:?}: {:?}",
-                addr,
-                welcome
-            ),
+            Chunk::GroupWelcome(welcome) => {
+                tracing::warn!(
+                    from = %display_addr(&addr),
+                    ?welcome,
+                    "received unexpected group welcome message",
+                );
+            }
             Chunk::GroupAck(ack) => self.process_ack(ack, &addr),
             Chunk::GroupLeave(leave) => self.process_leave(leave, &addr),
             Chunk::GroupDisconnected(disconnected) => self.process_disconnected(disconnected, addr),
@@ -366,10 +358,6 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
         buffer: &ChunkBuffer,
         packet_size: usize,
     ) -> Result<(), std::io::Error> {
-        log::trace!(
-            "sending chunk buffer to {}",
-            display_addr(&self.multicast_addr)
-        );
         self.channel
             .send_chunk_buffer_to(buffer, packet_size, &self.multicast_addr)
     }
@@ -491,10 +479,10 @@ impl<I: GroupMemberTypeImpl> ConnectedGroupMember<I> {
             Chunk::SessionWelcome(_) => unreachable!("received session welcome in channel"),
             Chunk::SessionHeartbeat(_) => unreachable!("received session heartbeat in channel"),
             Chunk::GroupJoin(_) | Chunk::GroupWelcome(_) | Chunk::GroupLeave(_) => {
-                log::trace!(
-                    "INGORED: received unexpected chunk from group {}: {:?}",
-                    display_addr(addr),
-                    chunk
+                tracing::error!(
+                    from = %display_addr(addr),
+                    ?chunk,
+                    "received unexpected group message",
                 );
                 Ok(false)
             }
@@ -583,6 +571,7 @@ pub enum GroupMember<I: GroupMemberTypeImpl> {
 }
 
 impl<I: GroupMemberTypeImpl> GroupMember<I> {
+    #[tracing::instrument(skip(inner, coordinator_channel, multicast_channel))]
     pub fn join(
         coordinator_addr: SockAddr,
         coordinator_channel: Channel,
@@ -592,10 +581,11 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
         let group_id = coordinator_channel.id();
 
         for deadline in ExponentialBackoff::new() {
-            log::trace!(
-                "send join request with type {} to group {}",
-                I::GROUP_TYPE,
-                group_id,
+            tracing::trace!(
+                coordinator_addr = %display_addr(&coordinator_addr),
+                group_id = <_ as Into<u16>>::into(group_id),
+                group_type = <_ as Into<u8>>::into(I::GROUP_TYPE),
+                "send group join message"
             );
             coordinator_channel.send_chunk_to(
                 &GroupJoin {
@@ -609,21 +599,30 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
                 match coordinator_channel.recv_until(deadline) {
                     Ok(chunk) => match chunk.validate() {
                         Ok(Chunk::GroupWelcome(welcome)) => {
-                            log::trace!("received welcome from group {}: {:?}", group_id, welcome);
+                            tracing::trace!(
+                                group_id = <_ as Into<u16>>::into(group_id),
+                                ?welcome,
+                                "received group welcome message"
+                            );
+
                             let state = GroupMemberState {};
                             let mut inner = inner;
                             inner.process_group_join(welcome.seq, &state);
                             return Ok(Self::Connected(ConnectedGroupMember {
-                                group_id: group_id,
+                                group_id,
                                 coordinator_channel,
                                 multicast_channel,
-                                inner: inner,
+                                inner,
                                 state,
                                 coordinator_addr,
                             }));
                         }
                         Ok(Chunk::GroupDisconnected(_)) => {
-                            log::trace!("received disconnect from group {}", group_id,);
+                            tracing::trace!(
+                                group_id = <_ as Into<u16>>::into(group_id),
+                                "received group disconnected message"
+                            );
+
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionAborted,
                                 "channel disconnected",
@@ -643,16 +642,16 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
                             | Chunk::BarrierReached(_)
                             | Chunk::BarrierReleased(_),
                         ) => {
-                            log::trace!(
-                                "IGNORED: received unexpected chunk from group {}: {:?}",
-                                group_id,
-                                chunk
+                            tracing::warn!(
+                                group_id = <_ as Into<u16>>::into(group_id),
+                                ?chunk,
+                                "recieved unexpected chunk"
                             );
                         }
                         Err(err) => {
-                            log::trace!(
-                                "IGNORED: received invalid chunk as join resquest response: {:?}",
-                                err
+                            tracing::warn!(
+                                error = %err,
+                                "received invalid chunk as join resquest response",
                             );
                         }
                     },

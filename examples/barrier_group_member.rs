@@ -6,7 +6,10 @@ use std::{
 use multicast::session::{GroupId, Member};
 
 fn main() {
-    env_logger::init();
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber =
+        tracing_subscriber::Registry::default().with(tracing_tape::TapeRecorder::default());
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let mut args = std::env::args();
     let _ = args.next().unwrap();
@@ -22,7 +25,7 @@ fn main() {
     }
 
     let before = Instant::now();
-    for _ in 0..1000 {
+    for _ in 0..10000 {
         barrier_group_member.wait().unwrap();
     }
     let after = Instant::now();

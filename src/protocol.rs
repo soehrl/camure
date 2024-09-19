@@ -50,6 +50,12 @@ impl Display for SequenceNumber {
 }
 
 impl SequenceNumber {
+    pub fn skip(self, offset: usize) -> Self {
+        let val: u16 = self.0.into();
+        let val = val.wrapping_add(offset as u16);
+        SequenceNumber(val.into())
+    }
+
     pub fn next(self) -> Self {
         let val: u16 = self.0.into();
         SequenceNumber(val.wrapping_add(1).into())

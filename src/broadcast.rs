@@ -10,17 +10,24 @@ use socket2::SockAddr;
 use zerocopy::FromBytes;
 
 use crate::{
-    chunk::{Chunk, ChunkBuffer}, chunk_socket::ReceivedChunk, group::{
+    chunk::{Chunk, ChunkBuffer},
+    chunk_socket::ReceivedChunk,
+    group::{
         GroupCoordinator, GroupCoordinatorState, GroupCoordinatorTypeImpl, GroupMember,
         GroupMemberState, GroupMemberTypeImpl,
-    }, protocol::{
-        self, BroadcastFinalMessageFragment, BroadcastFirstMessageFragment, BroadcastMessage, BroadcastMessageFragment, SequenceNumber, MESSAGE_PAYLOAD_OFFSET
-    }, session::GroupId, utils::{display_addr, sock_addr_to_socket_addr}
+    },
+    protocol::{
+        self, BroadcastFinalMessageFragment, BroadcastFirstMessageFragment, BroadcastMessage,
+        BroadcastMessageFragment, SequenceNumber, MESSAGE_PAYLOAD_OFFSET,
+    },
+    session::GroupId,
+    utils::{display_addr, sock_addr_to_socket_addr},
 };
 
 /// A chunk that has been sent but not yet acknowledged by all subscribers.
 #[derive(Debug)]
 struct UnacknowledgedChunk {
+    initial_send_time: std::time::Instant,
     retransmit_time: std::time::Instant,
     buffer: ChunkBuffer,
     packet_size: usize,
@@ -73,6 +80,13 @@ impl GroupCoordinatorTypeImpl for BroadcastGroupSenderState {
             | Chunk::GroupWelcome(_)
             | Chunk::GroupLeave(_)
             | Chunk::GroupDisconnected(_) => {
+                // These chunks cannot be forwared to this function, as they should have been
+                // filtered out by either the multiplex socket or the GroupCoordinator.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received invalid chunk in broadcast group",
+                );
                 unreachable!();
             }
             Chunk::BarrierReached(_)
@@ -81,7 +95,13 @@ impl GroupCoordinatorTypeImpl for BroadcastGroupSenderState {
             | Chunk::BroadcastFirstMessageFragment(_)
             | Chunk::BroadcastMessageFragment(_)
             | Chunk::BroadcastFinalMessageFragment(_) => {
-                log::trace!("IGNORED: {:?}", chunk);
+                // These chunks could be forwarded to this function, but they would never been
+                // send by this crate.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received invalid message in broadcast group receiver",
+                );
             }
             Chunk::GroupAck(ack) => {
                 let offset = ack.seq - self.seq_not_ack;
@@ -89,31 +109,32 @@ impl GroupCoordinatorTypeImpl for BroadcastGroupSenderState {
                     // TODO: check if this is actually the correct chunk: checksum?
                     if let Some(chunk) = &mut self.unacknowledged_chunks[offset as usize] {
                         if chunk.missing_acks.remove(addr) {
-                            log::trace!(
-                                "received ack for seq {} from {}",
-                                ack.seq,
-                                display_addr(addr)
+                            tracing::trace!(
+                                seq = <_ as Into<u16>>::into(ack.seq),
+                                from = %display_addr(addr),
+                                rtt = ?chunk.initial_send_time.elapsed(),
+                                "received ack",
                             );
                         } else {
-                            log::trace!(
-                                "IGNORED: ack for seq {} from {} (already acked)",
-                                ack.seq,
-                                display_addr(addr)
+                            tracing::trace!(
+                                seq = <_ as Into<u16>>::into(ack.seq),
+                                from = %display_addr(addr),
+                                rtt = ?chunk.initial_send_time.elapsed(),
+                                "received duplicate ack",
                             );
                         }
                     } else {
-                        log::trace!(
-                            "IGNORED: ack for seq {} from {} (already acked)",
-                            ack.seq,
-                            display_addr(addr)
+                        tracing::trace!(
+                            seq = <_ as Into<u16>>::into(ack.seq),
+                            from = %display_addr(addr),
+                            "received duplicate ack",
                         );
                     }
                 } else {
-                    log::trace!(
-                        "IGNORED: ack for seq {} from {} (seq_ack: {})",
-                        ack.seq,
-                        display_addr(addr),
-                        self.seq_not_ack
+                    tracing::trace!(
+                        seq = <_ as Into<u16>>::into(ack.seq),
+                        from = %display_addr(addr),
+                        "received invalid ack, duplicate?",
                     );
                 }
             }
@@ -138,18 +159,32 @@ impl BroadcastGroupSender {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     fn process_unacknlowedged_chunks(&mut self) -> std::io::Result<()> {
         let inner = &mut self.group.inner;
-        for maybe_chunk in &mut inner.unacknowledged_chunks {
+        for (index, maybe_chunk) in inner.unacknowledged_chunks.iter_mut().enumerate() {
+            let chunk_seq = inner.seq_not_ack.skip(index);
+
             if let Some(chunk) = maybe_chunk {
                 if chunk.missing_acks.is_empty() {
-                    log::trace!("all members have acknowledged seq {}", inner.seq_not_ack);
+                    tracing::trace!(
+                        seq = <_ as Into<u16>>::into(chunk_seq),
+                        elapsed = ?chunk.initial_send_time.elapsed(),
+                        "all members acknowledged chunk",
+                    );
                     // TODO: use take_if when it becomes stable
                     maybe_chunk.take();
                     inner.packets_in_flight -= 1;
                 } else {
                     if chunk.retransmit_time < std::time::Instant::now() {
-                        log::trace!("retransmitting packet");
+                        tracing::trace!(
+                            seq = <_ as Into<u16>>::into(chunk_seq),
+                            elapsed = ?chunk.initial_send_time.elapsed(),
+                            last_retransmit = ?chunk.retransmit_time.elapsed(),
+                            retransmit_count = chunk.retransmit_count,
+                            "all members acknowledged chunk",
+                        );
+
                         self.group.channel.send_chunk_buffer_to(
                             &chunk.buffer,
                             chunk.packet_size,
@@ -168,7 +203,6 @@ impl BroadcastGroupSender {
 
         // Remove acknowledged chunks from the front
         while let Some(None) = inner.unacknowledged_chunks.front() {
-            log::debug!("removing acknowledged chunk");
             inner.unacknowledged_chunks.pop_front();
             inner.seq_not_ack = inner.seq_not_ack.next();
         }
@@ -189,8 +223,9 @@ impl BroadcastGroupSender {
     /// This method must be called periodically to ensure that messages are sent
     /// and received. It is also called by the `accept` and `try_accept`
     /// methods and when writing a message.
+    #[tracing::instrument(skip(self))]
     pub fn process(&mut self) -> std::io::Result<()> {
-        self.group.recv()?;
+        self.group.try_recv()?;
         self.process_unacknlowedged_chunks()
     }
 
@@ -199,16 +234,19 @@ impl BroadcastGroupSender {
     /// This method must be called periodically to ensure that messages are sent
     /// and received. It is also called by the `accept` and `try_accept`
     /// methods and when writing a message.
+    #[tracing::instrument(skip(self))]
     pub fn try_process(&mut self) -> std::io::Result<()> {
         self.group.try_recv()?;
         self.process_unacknlowedged_chunks()
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn accept(&mut self) -> std::io::Result<SocketAddr> {
         self.process()?;
         self.group.accept().and_then(sock_addr_to_socket_addr)
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn try_accept(&mut self) -> std::io::Result<Option<SocketAddr>> {
         self.process_unacknlowedged_chunks()?;
 
@@ -221,6 +259,7 @@ impl BroadcastGroupSender {
         }
     }
 
+    #[tracing::instrument(skip(self, buffer))]
     fn send_message_buffer(
         &mut self,
         mut buffer: ChunkBuffer,
@@ -232,8 +271,6 @@ impl BroadcastGroupSender {
             seq: self.group.state.seq,
             group_id: self.group.id(),
         });
-
-        log::trace!("sending broadcast message {fragment_index} {last}");
 
         match (fragment_index, last) {
             (0, true) => {}
@@ -248,22 +285,28 @@ impl BroadcastGroupSender {
             }
         }
 
-        while self.group.inner.packets_in_flight >= self.max_packets_in_flight {
-            log::trace!(
-                "too many packets ({}) in flight (max: {})",
-                self.group.inner.packets_in_flight,
-                self.max_packets_in_flight
-            );
-            self.process()?;
-        }
+        tracing::trace_span!("wait for packages").in_scope(|| -> std::io::Result<()> {
+            while self.group.inner.packets_in_flight >= self.max_packets_in_flight {
+                tracing::trace!(
+                    packets_in_flight = self.group.inner.packets_in_flight,
+                    max_packets_in_flight = self.max_packets_in_flight,
+                    "too many packets in flight",
+                );
+                self.process()?;
+            }
+            Ok(())
+        });
 
         self.group
             .send_chunk_buffer_to_group(&buffer, packet_size)?;
+        let send_time = std::time::Instant::now();
+
         self.group
             .inner
             .unacknowledged_chunks
             .push_back(Some(UnacknowledgedChunk {
-                retransmit_time: std::time::Instant::now() + self.initial_retransmit_delay,
+                retransmit_time: send_time,
+                initial_send_time: send_time,
                 buffer,
                 packet_size,
                 missing_acks: self.group.state.members.clone(),
@@ -300,8 +343,8 @@ pub struct MessageWriter<'a> {
 }
 
 impl Drop for MessageWriter<'_> {
+    #[tracing::instrument(skip(self))]
     fn drop(&mut self) {
-        log::trace!("sending");
         let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
         self.sender
             .send_message_buffer(buffer, self.fragment_count, true, self.cursor)
@@ -310,6 +353,7 @@ impl Drop for MessageWriter<'_> {
 }
 
 impl Write for MessageWriter<'_> {
+    #[tracing::instrument(skip(self))]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut src_bytes = buf;
 
@@ -361,6 +405,7 @@ pub struct MessageReader<'a> {
 }
 
 impl Read for MessageReader<'_> {
+    #[tracing::instrument(skip(self))]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
         let total_len = buf.len();
         let mut dst_bytes = buf;
@@ -410,12 +455,22 @@ impl GroupMemberTypeImpl for BroadcastGroupReceiverState {
             | Chunk::GroupWelcome(_)
             | Chunk::GroupLeave(_)
             | Chunk::GroupDisconnected(_) => {
+                // These chunks cannot be forwared to this function, as they should have been
+                // filtered out by either the multiplex socket or the GroupCoordinator.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received invalid chunk in broadcast group",
+                );
                 unreachable!();
             }
             Chunk::BarrierReached(_) | Chunk::BarrierReleased(_) | Chunk::GroupAck(_) => {
-                log::trace!(
-                    "IGNORED: chunk from {} received in broadcast group",
-                    display_addr(addr),
+                // These chunks could be forwarded to this function, but they would never been
+                // send by this crate.
+                tracing::error!(
+                    ?chunk,
+                    from = %display_addr(addr),
+                    "received invalid message in broadcast group receiver",
                 );
                 false
             }
@@ -426,16 +481,19 @@ impl GroupMemberTypeImpl for BroadcastGroupReceiverState {
                 let offset = *seq - self.next_seq;
                 if offset > u16::MAX as usize / 2 {
                     // This is most likely an old packet, just ignore it
-                    log::trace!(
-                        "IGNORED: chunk from {} received in broadcast group (old packet)",
-                        display_addr(addr),
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(*seq),
+                        expected_seq = <_ as Into<u16>>::into(self.next_seq),
+                        "received old chunk",
                     );
                     false
                 } else {
-                    log::trace!(
-                        "received chunk from {} in broadcast group: seq: {}",
-                        display_addr(addr),
-                        seq,
+                    tracing::trace!(
+                        from = %display_addr(addr),
+                        seq = <_ as Into<u16>>::into(*seq),
+                        expected_seq = <_ as Into<u16>>::into(self.next_seq),
+                        "received chunk",
                     );
 
                     if offset as usize >= self.chunks.len() {
@@ -460,7 +518,13 @@ impl GroupMemberTypeImpl for BroadcastGroupReceiverState {
         debug_assert!(offset < u16::MAX as usize / 2);
         debug_assert!(offset < self.chunks.len());
         debug_assert!(self.chunks[offset].is_none());
-        log::trace!("inserting chunk with seq {msg_seq} at offset {offset}");
+        tracing::trace!(
+            from = %display_addr(&chunk.addr()),
+            seq = <_ as Into<u16>>::into(msg_seq),
+            expected_seq = <_ as Into<u16>>::into(self.next_seq),
+            offset,
+            "inserting chunk",
+        );
         self.chunks[offset] = Some(chunk);
     }
 }
@@ -483,24 +547,43 @@ impl BroadcastGroupReceiver {
                                 chunk_count = 1;
                                 break;
                             } else {
-                                panic!("unexpected chunk: {:?}", chunk);
+                                tracing::error!(
+                                    ?chunk,
+                                    expected_kind = "CHUNK_ID_BROADCAST_MESSAGE_FRAGMENT or CHUNK_ID_BROADCAST_FINAL_MESSAGE_FRAGMENT",
+                                    "unepxected chunk"
+                                );
+                                return Err(std::io::ErrorKind::InvalidData.into());
                             }
                         }
                         protocol::CHUNK_ID_BROADCAST_FIRST_MESSAGE_FRAGMENT => {
                             if index == 0 {
                             } else {
-                                panic!("unexpected chunk: {:?}", chunk);
+                                tracing::error!(
+                                    ?chunk,
+                                    expected_kind = "CHUNK_ID_BROADCAST_MESSAGE_FRAGMENT or CHUNK_ID_BROADCAST_FINAL_MESSAGE_FRAGMENT",
+                                    "unepxected chunk"
+                                );
+                                return Err(std::io::ErrorKind::InvalidData.into());
                             }
                         }
                         protocol::CHUNK_ID_BROADCAST_MESSAGE_FRAGMENT => {
                             if index == 0 {
-                                panic!("unexpected chunk: {:?}", chunk);
-                            } else {
+                                tracing::error!(
+                                    ?chunk,
+                                    expected_kind = "CHUNK_ID_BROADCAST_FIST_MESSAGE_FRAGMENT or CHUNK_ID_BROADCAST_MESSAGE",
+                                    "unepxected chunk"
+                                );
+                                return Err(std::io::ErrorKind::InvalidData.into());
                             }
                         }
                         protocol::CHUNK_ID_BROADCAST_FINAL_MESSAGE_FRAGMENT => {
                             if index == 0 {
-                                panic!("unexpected chunk: {:?}", chunk);
+                                tracing::error!(
+                                    ?chunk,
+                                    expected_kind = "CHUNK_ID_BROADCAST_FIST_MESSAGE_FRAGMENT or CHUNK_ID_BROADCAST_MESSAGE",
+                                    "unepxected chunk"
+                                );
+                                return Err(std::io::ErrorKind::InvalidData.into());
                             } else {
                                 chunk_count = index + 1;
                                 break;
