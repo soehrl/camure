@@ -162,6 +162,8 @@ impl BroadcastGroupSender {
     #[tracing::instrument(skip(self))]
     fn process_unacknlowedged_chunks(&mut self) -> std::io::Result<()> {
         let inner = &mut self.group.inner;
+        let mut dead_members = vec![];
+
         for (index, maybe_chunk) in inner.unacknowledged_chunks.iter_mut().enumerate() {
             let chunk_seq = inner.seq_not_ack.skip(index);
 
@@ -177,13 +179,21 @@ impl BroadcastGroupSender {
                     inner.packets_in_flight -= 1;
                 } else {
                     if chunk.retransmit_time < std::time::Instant::now() {
-                        tracing::trace!(
+                        for addr in &chunk.missing_acks {
+                            if !self.group.session_members.is_alive(addr) {
+                                dead_members.push(addr.clone());
+                            }
+                        }
+
+                        tracing::debug!(
                             seq = <_ as Into<u16>>::into(chunk_seq),
                             elapsed = ?chunk.initial_send_time.elapsed(),
                             last_retransmit = ?chunk.retransmit_time.elapsed(),
                             retransmit_count = chunk.retransmit_count,
-                            "all members acknowledged chunk",
+                            missing_acks = ?chunk.missing_acks.iter().map(display_addr).collect::<Vec<_>>(),
+                            "retransmitting chunk",
                         );
+                        chunk.retransmit_count += 1;
 
                         self.group.channel.send_chunk_buffer_to(
                             &chunk.buffer,
@@ -205,6 +215,11 @@ impl BroadcastGroupSender {
         while let Some(None) = inner.unacknowledged_chunks.front() {
             inner.unacknowledged_chunks.pop_front();
             inner.seq_not_ack = inner.seq_not_ack.next();
+        }
+
+        for addr in dead_members {
+            tracing::debug!(addr = %display_addr(&addr), "timeout");
+            self.group.remove(&addr)?;
         }
 
         Ok(())
@@ -286,16 +301,20 @@ impl BroadcastGroupSender {
         }
 
         tracing::trace_span!("wait for packages").in_scope(|| -> std::io::Result<()> {
-            while self.group.inner.packets_in_flight >= self.max_packets_in_flight {
-                tracing::trace!(
-                    packets_in_flight = self.group.inner.packets_in_flight,
-                    max_packets_in_flight = self.max_packets_in_flight,
-                    "too many packets in flight",
-                );
+            loop {
                 self.process()?;
+                if self.group.inner.packets_in_flight >= self.max_packets_in_flight {
+                    tracing::trace!(
+                        packets_in_flight = self.group.inner.packets_in_flight,
+                        max_packets_in_flight = self.max_packets_in_flight,
+                        "too many packets in flight",
+                    );
+                } else {
+                    break;
+                }
             }
             Ok(())
-        });
+        })?;
 
         self.group
             .send_chunk_buffer_to_group(&buffer, packet_size)?;
@@ -305,7 +324,7 @@ impl BroadcastGroupSender {
             .inner
             .unacknowledged_chunks
             .push_back(Some(UnacknowledgedChunk {
-                retransmit_time: send_time,
+                retransmit_time: send_time + self.initial_retransmit_delay,
                 initial_send_time: send_time,
                 buffer,
                 packet_size,

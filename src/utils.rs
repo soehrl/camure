@@ -17,6 +17,15 @@ impl Display for DisplaySockAddr<'_> {
     }
 }
 
+impl std::fmt::Debug for DisplaySockAddr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0.as_socket() {
+            Some(addr) => write!(f, "{}", addr),
+            None => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
 pub fn display_addr(addr: &SockAddr) -> DisplaySockAddr {
     DisplaySockAddr(addr)
 }

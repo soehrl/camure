@@ -204,23 +204,20 @@ impl BarrierGroupCoordinator {
                 }
             }
 
-            let mut members_to_remove = HashSet::default();
-            tracing::trace!(
-                missing_acks_from = ?self.group.inner.ack_required.iter().map(display_addr),
-                "timout while waiting for ack",
-            );
+            let mut dead_members = vec![];
             for addr in &self.group.inner.ack_required {
                 if !self.group.session_members.is_alive(addr) {
-                    members_to_remove.insert(addr.clone());
+                    dead_members.push(addr.clone());
                 }
             }
-
-            tracing::trace!(
-                disconnected_members = ?members_to_remove.iter().map(display_addr),
-                "removing disconnected members",
-            );
-            for addr in members_to_remove {
+            for addr in dead_members {
+                tracing::debug!(addr = %display_addr(&addr), "timeout");
                 self.group.remove(&addr)?;
+            }
+
+            if self.group.inner.ack_required.is_empty() {
+                tracing::trace!("all acks received");
+                return Ok(());
             }
         }
         unreachable!();
@@ -237,7 +234,26 @@ impl BarrierGroupCoordinator {
         tracing::trace_span!("waiting for all members to arrive").in_scope(
             || -> std::io::Result<()> {
                 while !self.all_members_arrived() {
-                    self.group.recv()?;
+                    let now = std::time::Instant::now();
+                    if let Err(err) = self
+                        .group
+                        .recv_until(now + std::time::Duration::from_millis(100))
+                    {
+                        if err.kind() == std::io::ErrorKind::TimedOut {
+                            let mut dead_members = vec![];
+                            for addr in &self.group.state.members {
+                                if !self.group.session_members.is_alive(addr) {
+                                    dead_members.push(addr.clone());
+                                }
+                            }
+                            for addr in dead_members {
+                                tracing::debug!(addr = %display_addr(&addr), "timeout");
+                                self.group.remove(&addr)?;
+                            }
+                        } else {
+                            return Err(err);
+                        }
+                    }
                 }
                 Ok(())
             },

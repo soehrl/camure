@@ -16,6 +16,9 @@ pub type ChunkSender = Sender<ReceivedChunk>;
 pub type ChunkReceiver = Receiver<ReceivedChunk>;
 
 pub enum CallbackReason<'a> {
+    ChunkHandled {
+        addr: &'a SockAddr,
+    },
     UnhandledChunk {
         chunk: Chunk<'a>,
         addr: &'a SockAddr,
@@ -269,9 +272,16 @@ impl MultiplexSocket {
                             "handle chunk",
                             from = %display_addr(chunk.addr()),
                             ?chunk,
-                        ).enter();
+                        )
+                        .enter();
+                        tracing::trace!(
+                            ?c,
+                            from = %display_addr(chunk.addr()),
+                            "received chunk"
+                        );
 
                         if let Some(channel_id) = c.channel_id() {
+                            callback(&receiver_socket, CallbackReason::ChunkHandled { addr: chunk.addr() });
                             let ack = c.requires_ack().map(|c| (c, chunk.addr().clone()));
 
                             match receiver_socket.forward_chunk(
@@ -319,23 +329,32 @@ impl MultiplexSocket {
                                         ?chunk,
                                         "chunk dropped due to disconnected channel"
                                     );
-                                    if let Err(err) = receiver_socket
-                                        .send_chunk_to(&GroupDisconnected(channel_id), chunk.addr())
-                                    {
-                                        tracing::error!(
-                                            %channel_id,
-                                            to = %display_addr(&chunk.addr()),
-                                            err = %err,
-                                            "failed to send group disconnect message"
-                                        );
-                                        todo!("close connection");
-                                    } else {
-                                        tracing::trace!(
-                                            %channel_id,
-                                            to = %display_addr(&chunk.addr()),
-                                            "sent group disconnect message"
-                                        );
-                                    }
+                                    // FIXME: we received a chunk for a channel we are not
+                                    // connected to. We should forward this to the creator of the
+                                    // channel to handle this appropriately.
+                                    
+                                    // if let Err(err) = receiver_socket
+                                    //     .send_chunk_to(&
+                                    // GroupDisconnected(channel_id),
+                                    // chunk.addr())
+                                    // {
+                                    //     tracing::error!(
+                                    //         %channel_id,
+                                    //         to =
+                                    // %display_addr(&chunk.addr()),
+                                    //         err = %err,
+                                    //         "failed to send group disconnect
+                                    // message"
+                                    //     );
+                                    //     todo!("close connection");
+                                    // } else {
+                                    //     tracing::trace!(
+                                    //         %channel_id,
+                                    //         to =
+                                    // %display_addr(&chunk.addr()),
+                                    //         "sent group disconnect message"
+                                    //     );
+                                    // }
                                 }
                             }
                         } else {

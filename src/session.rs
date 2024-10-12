@@ -266,6 +266,9 @@ impl Coordinator {
         member_vitals: Arc<MemberVitals>,
     ) -> impl Callback {
         move |socket, reason| match reason {
+            CallbackReason::ChunkHandled { addr } => {
+                member_vitals.update_heartbeat(addr.clone());
+            }
             CallbackReason::UnhandledChunk {
                 addr,
                 chunk: Chunk::SessionHeartbeat(SessionHeartbeat),

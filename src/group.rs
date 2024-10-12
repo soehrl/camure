@@ -138,7 +138,11 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
                 }
             }
 
-            tracing::trace!("success");
+            tracing::info!(
+                addr = %display_addr(&addr),
+                channel_id = ?self.channel.id(),
+                "member joined group",
+            );
             debug_assert!(self.state.members.contains(&addr));
             self.state.member_requests.remove(&addr);
             self.inner.process_member_joined(&addr, &self.state);
@@ -184,6 +188,14 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
 
     #[tracing::instrument(skip(self))]
     fn process_join(&mut self, join: &GroupJoin, addr: &SockAddr) {
+        tracing::info!(
+            channel_id = <_ as Into<u16>>::into(self.channel.id()),
+            addr = %display_addr(addr),
+            group_id = <_ as Into<u16>>::into(join.group_id),
+            group_type = <_ as Into<u8>>::into(join.group_type),
+            "received join message",
+        );
+
         debug_assert_eq!(
             self.channel.id(),
             join.group_id,
@@ -216,6 +228,11 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
                 &GroupDisconnected(self.channel.id().into()),
                 b"duplicate join",
                 addr,
+            );
+            tracing::warn!(
+                channel_id = <_ as Into<u16>>::into(self.channel.id()),
+                addr = %display_addr(addr),
+                "received duplicate join message",
             );
             return;
         }
@@ -251,6 +268,12 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
     }
 
     fn process_leave(&mut self, GroupLeave(channel_id): &GroupLeave, addr: &SockAddr) {
+        tracing::info!(
+            channel_id = <_ as Into<u16>>::into(*channel_id),
+            addr = %display_addr(addr),
+            "received leave message",
+        );
+
         debug_assert_eq!(
             self.channel.id(),
             *channel_id,
@@ -414,7 +437,9 @@ pub struct ConnectedGroupMember<I: GroupMemberTypeImpl> {
 }
 
 impl<I: GroupMemberTypeImpl> Drop for ConnectedGroupMember<I> {
+    #[tracing::instrument(skip(self))]
     fn drop(&mut self) {
+        tracing::trace!("leave group");
         let _ = self.leave();
     }
 }
