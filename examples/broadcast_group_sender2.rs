@@ -29,7 +29,10 @@ Etiam non augue dapibus, pellentesque felis eu, efficitur leo. Praesent vehicula
 ";
 
 fn main() {
-    env_logger::init();
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber =
+        tracing_subscriber::Registry::default().with(tracing_subscriber::fmt::Layer::default());
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let mut args = std::env::args();
     let _ = args.next().unwrap();

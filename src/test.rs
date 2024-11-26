@@ -12,7 +12,7 @@ pub fn get_port() -> u16 {
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub fn init_logger() {
-    let _ = env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Trace)
-        .try_init();
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber = tracing_subscriber::Registry::default().with(tracing_subscriber::fmt::layer());
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
