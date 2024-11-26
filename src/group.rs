@@ -393,15 +393,15 @@ impl<I: GroupCoordinatorTypeImpl> GroupCoordinator<I> {
         self.channel.send_chunk_to(header, &self.multicast_addr)
     }
 
-    #[inline]
-    pub fn send_chunk_with_payload_to_group<H: protocol::ChunkHeader>(
-        &mut self,
-        header: &H,
-        payload: &[u8],
-    ) -> Result<(), std::io::Error> {
-        self.channel
-            .send_chunk_with_payload_to(header, payload, &self.multicast_addr)
-    }
+    // #[inline]
+    // pub fn send_chunk_with_payload_to_group<H: protocol::ChunkHeader>(
+    //     &mut self,
+    //     header: &H,
+    //     payload: &[u8],
+    // ) -> Result<(), std::io::Error> {
+    //     self.channel
+    //         .send_chunk_with_payload_to(header, payload, &self.multicast_addr)
+    // }
 }
 
 #[derive(Debug, Default)]
@@ -415,8 +415,8 @@ pub trait GroupMemberTypeImpl {
     #[allow(unused_variables)]
     fn process_group_join(&mut self, seq: protocol::SequenceNumber, group: &GroupMemberState) {}
 
-    #[allow(unused_variables)]
-    fn process_disconnected(&mut self, group: &GroupMemberState) {}
+    // #[allow(unused_variables)]
+    // fn process_disconnected(&mut self, group: &GroupMemberState) {}
 
     #[allow(unused_variables)]
     fn process_chunk(&mut self, chunk: Chunk, addr: &SockAddr, group: &GroupMemberState) -> bool {
@@ -555,19 +555,19 @@ impl<I: GroupMemberTypeImpl> ConnectedGroupMember<I> {
         }
     }
 
-    /// Waits for a chunk and processes it.
-    #[inline]
-    pub fn try_recv(&mut self) -> Result<(), std::io::Error> {
-        while let Some(chunk) = self.coordinator_channel.try_recv()? {
-            self.process_received_chunk(chunk)?;
-        }
+    // /// Waits for a chunk and processes it.
+    // #[inline]
+    // pub fn try_recv(&mut self) -> Result<(), std::io::Error> {
+    //     while let Some(chunk) = self.coordinator_channel.try_recv()? {
+    //         self.process_received_chunk(chunk)?;
+    //     }
 
-        while let Some(chunk) = self.multicast_channel.try_recv()? {
-            self.process_received_chunk(chunk)?;
-        }
+    //     while let Some(chunk) = self.multicast_channel.try_recv()? {
+    //         self.process_received_chunk(chunk)?;
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     /// Waits for a chunk until the deadline and processes it if one is
     /// received.
@@ -592,7 +592,7 @@ impl<I: GroupMemberTypeImpl> ConnectedGroupMember<I> {
 
 pub enum GroupMember<I: GroupMemberTypeImpl> {
     Connected(ConnectedGroupMember<I>),
-    Disconnected,
+    // Disconnected,
 }
 
 impl<I: GroupMemberTypeImpl> GroupMember<I> {
@@ -696,7 +696,7 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
     pub fn id(&self) -> std::io::Result<GroupId> {
         match self {
             Self::Connected(inner) => Ok(inner.group_id),
-            Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
+            // Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
         }
     }
 
@@ -704,7 +704,7 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
     pub fn inner(&self) -> std::io::Result<&I> {
         match self {
             Self::Connected(inner) => Ok(&inner.inner),
-            Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
+            // Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
         }
     }
 
@@ -712,7 +712,7 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
     pub fn inner_mut(&mut self) -> std::io::Result<&mut I> {
         match self {
             Self::Connected(inner) => Ok(&mut inner.inner),
-            Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
+            // Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
         }
     }
 
@@ -720,7 +720,7 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
     pub fn recv(&mut self) -> std::io::Result<()> {
         match self {
             Self::Connected(inner) => inner.recv(),
-            Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
+            // Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
         }
     }
 
@@ -728,7 +728,7 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
     pub fn recv_until(&mut self, dealine: Instant) -> std::io::Result<()> {
         match self {
             Self::Connected(inner) => inner.recv_until(dealine),
-            Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
+            // Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
         }
     }
 
@@ -738,7 +738,7 @@ impl<I: GroupMemberTypeImpl> GroupMember<I> {
             Self::Connected(inner) => inner
                 .coordinator_channel
                 .send_chunk_to(header, &inner.coordinator_addr),
-            Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
+            // Self::Disconnected => Err(std::io::ErrorKind::NotConnected.into()),
         }
     }
 }

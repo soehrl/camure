@@ -1,14 +1,14 @@
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc};
 
 use ahash::HashMap;
-use crossbeam::channel::{Receiver, RecvTimeoutError, Select, Sender, TryRecvError, TrySendError};
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use dashmap::DashMap;
 use socket2::{SockAddr, Socket};
 
 use crate::{
     chunk::{Chunk, ChunkBuffer, ChunkBufferAllocator},
     chunk_socket::{ChunkSocket, ReceivedChunk},
-    protocol::{self, ChunkHeader, GroupDisconnected},
+    protocol::{self, ChunkHeader},
     utils::display_addr,
 };
 
@@ -74,10 +74,10 @@ impl Channel {
         self.socket.buffer_allocator()
     }
 
-    #[inline]
-    pub fn send_chunk<H: ChunkHeader>(&self, kind_data: &H) -> Result<(), std::io::Error> {
-        self.socket.send_chunk(kind_data)
-    }
+    // #[inline]
+    // pub fn send_chunk<H: ChunkHeader>(&self, kind_data: &H) -> Result<(),
+    // std::io::Error> {     self.socket.send_chunk(kind_data)
+    // }
 
     #[inline]
     pub fn send_chunk_buffer_to(
@@ -281,7 +281,10 @@ impl MultiplexSocket {
                         );
 
                         if let Some(channel_id) = c.channel_id() {
-                            callback(&receiver_socket, CallbackReason::ChunkHandled { addr: chunk.addr() });
+                            callback(
+                                &receiver_socket,
+                                CallbackReason::ChunkHandled { addr: chunk.addr() },
+                            );
                             let ack = c.requires_ack().map(|c| (c, chunk.addr().clone()));
 
                             match receiver_socket.forward_chunk(
@@ -329,10 +332,12 @@ impl MultiplexSocket {
                                         ?chunk,
                                         "chunk dropped due to disconnected channel"
                                     );
-                                    // FIXME: we received a chunk for a channel we are not
-                                    // connected to. We should forward this to the creator of the
+                                    // FIXME: we received a chunk for a channel
+                                    // we are not
+                                    // connected to. We should forward this to
+                                    // the creator of the
                                     // channel to handle this appropriately.
-                                    
+
                                     // if let Err(err) = receiver_socket
                                     //     .send_chunk_to(&
                                     // GroupDisconnected(channel_id),
@@ -396,9 +401,9 @@ impl MultiplexSocket {
         })
     }
 
-    pub fn new(socket: Socket, buffer_allocator: Arc<ChunkBufferAllocator>) -> Arc<Self> {
-        Self::with_callback(socket, buffer_allocator, |_, _| {})
-    }
+    // pub fn new(socket: Socket, buffer_allocator: Arc<ChunkBufferAllocator>) ->
+    // Arc<Self> {     Self::with_callback(socket, buffer_allocator, |_, _| {})
+    // }
 
     pub fn with_sender_socket(socket: Socket, sender_socket: Arc<MultiplexSocket>) -> Arc<Self> {
         let result = Arc::new(Self {
@@ -429,21 +434,21 @@ impl MultiplexSocket {
         result
     }
 
-    pub fn with_callback_and_sender_socket<F: Callback>(
-        socket: Socket,
-        sender_socket: Arc<MultiplexSocket>,
-        buffer_allocator: Arc<ChunkBufferAllocator>,
-        callback: F,
-    ) -> Arc<Self> {
-        let result = Arc::new(Self {
-            inner: ChunkSocket::new(Arc::new(socket), buffer_allocator),
-            channels: DashMap::default(),
-        });
+    // pub fn with_callback_and_sender_socket<F: Callback>(
+    //     socket: Socket,
+    //     sender_socket: Arc<MultiplexSocket>,
+    //     buffer_allocator: Arc<ChunkBufferAllocator>,
+    //     callback: F,
+    // ) -> Arc<Self> {
+    //     let result = Arc::new(Self {
+    //         inner: ChunkSocket::new(Arc::new(socket), buffer_allocator),
+    //         channels: DashMap::default(),
+    //     });
 
-        Self::spawn_receiver_thread(result.clone(), sender_socket, callback);
+    //     Self::spawn_receiver_thread(result.clone(), sender_socket, callback);
 
-        result
-    }
+    //     result
+    // }
 
     #[inline]
     pub fn buffer_allocator(&self) -> &Arc<ChunkBufferAllocator> {
@@ -460,10 +465,10 @@ impl MultiplexSocket {
         self.inner.send_chunk_buffer_to(buffer, packet_size, addr)
     }
 
-    #[inline]
-    pub fn send_chunk<T: ChunkHeader>(&self, kind_data: &T) -> Result<(), std::io::Error> {
-        self.inner.send_chunk(kind_data)
-    }
+    // #[inline]
+    // pub fn send_chunk<T: ChunkHeader>(&self, kind_data: &T) -> Result<(),
+    // std::io::Error> {     self.inner.send_chunk(kind_data)
+    // }
 
     #[inline]
     pub fn send_chunk_to<T: ChunkHeader>(
@@ -474,14 +479,14 @@ impl MultiplexSocket {
         self.inner.send_chunk_to(kind_data, addr)
     }
 
-    #[inline]
-    pub fn send_chunk_with_payload<T: ChunkHeader>(
-        &self,
-        kind_data: &T,
-        payload: &[u8],
-    ) -> Result<(), std::io::Error> {
-        self.inner.send_chunk_with_payload(kind_data, payload)
-    }
+    // #[inline]
+    // pub fn send_chunk_with_payload<T: ChunkHeader>(
+    //     &self,
+    //     kind_data: &T,
+    //     payload: &[u8],
+    // ) -> Result<(), std::io::Error> {
+    //     self.inner.send_chunk_with_payload(kind_data, payload)
+    // }
 
     #[inline]
     pub fn send_chunk_with_payload_to<T: ChunkHeader>(
@@ -519,113 +524,113 @@ impl MultiplexSocket {
     }
 }
 
-pub fn wait_for_chunk2<T, P: FnMut(Chunk, SocketAddr) -> Option<T>>(
-    r: &[&ChunkReceiver],
-    timeout: std::time::Duration,
-    mut p: P,
-) -> Result<T, RecvTimeoutError> {
-    let start = std::time::Instant::now();
-    let deadline = start + timeout;
+// pub fn wait_for_chunk2<T, P: FnMut(Chunk, SocketAddr) -> Option<T>>(
+//     r: &[&ChunkReceiver],
+//     timeout: std::time::Duration,
+//     mut p: P,
+// ) -> Result<T, RecvTimeoutError> {
+//     let start = std::time::Instant::now();
+//     let deadline = start + timeout;
 
-    let mut sel = Select::new();
-    for r in r {
-        sel.recv(r);
-    }
+//     let mut sel = Select::new();
+//     for r in r {
+//         sel.recv(r);
+//     }
 
-    loop {
-        match sel.select_timeout(deadline - std::time::Instant::now()) {
-            Ok(recv) => {
-                let index = recv.index();
-                let chunk = recv.recv(r[index])?;
-                if let (Ok(chunk), Some(addr)) = (chunk.validate(), chunk.addr().as_socket()) {
-                    if let Some(v) = p(chunk, addr) {
-                        return Ok(v);
-                    }
-                }
-            }
-            Err(_) => return Err(RecvTimeoutError::Timeout),
-        }
-    }
-}
+//     loop {
+//         match sel.select_timeout(deadline - std::time::Instant::now()) {
+//             Ok(recv) => {
+//                 let index = recv.index();
+//                 let chunk = recv.recv(r[index])?;
+//                 if let (Ok(chunk), Some(addr)) = (chunk.validate(),
+// chunk.addr().as_socket()) {                     if let Some(v) = p(chunk,
+// addr) {                         return Ok(v);
+//                     }
+//                 }
+//             }
+//             Err(_) => return Err(RecvTimeoutError::Timeout),
+//         }
+//     }
+// }
 
-pub fn wait_for_chunk<P: FnMut(Chunk, SocketAddr) -> bool>(
-    r: &ChunkReceiver,
-    timeout: std::time::Duration,
-    mut p: P,
-) -> Result<(), RecvTimeoutError> {
-    let start = std::time::Instant::now();
-    let deadline = start + timeout;
+// pub fn wait_for_chunk<P: FnMut(Chunk, SocketAddr) -> bool>(
+//     r: &ChunkReceiver,
+//     timeout: std::time::Duration,
+//     mut p: P,
+// ) -> Result<(), RecvTimeoutError> {
+//     let start = std::time::Instant::now();
+//     let deadline = start + timeout;
 
-    loop {
-        match r.recv_deadline(deadline) {
-            Ok(chunk) => {
-                if let (Ok(chunk), Some(addr)) = (chunk.validate(), chunk.addr().as_socket()) {
-                    if p(chunk, addr) {
-                        return Ok(());
-                    }
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
+//     loop {
+//         match r.recv_deadline(deadline) {
+//             Ok(chunk) => {
+//                 if let (Ok(chunk), Some(addr)) = (chunk.validate(),
+// chunk.addr().as_socket()) {                     if p(chunk, addr) {
+//                         return Ok(());
+//                     }
+//                 }
+//             }
+//             Err(err) => return Err(err),
+//         }
+//     }
+// }
 
-#[derive(thiserror::Error, Debug)]
-pub enum TransmitAndWaitError {
-    #[error("receive error: {0}")]
-    RecvError(#[from] RecvTimeoutError),
+// #[derive(thiserror::Error, Debug)]
+// pub enum TransmitAndWaitError {
+//     #[error("receive error: {0}")]
+//     RecvError(#[from] RecvTimeoutError),
 
-    #[error("send error: {0}")]
-    SendError(#[from] std::io::Error),
-}
+//     #[error("send error: {0}")]
+//     SendError(#[from] std::io::Error),
+// }
 
-pub fn transmit_and_wait<C: ChunkHeader, T, P: FnMut(Chunk, SocketAddr) -> Option<T>>(
-    socket: &ChunkSocket,
-    kind_data: &C,
-    retransmit_timeout: std::time::Duration,
-    retransmit_count: usize,
-    r: &[&ChunkReceiver],
-    mut p: P,
-) -> Result<T, TransmitAndWaitError> {
-    for _ in 0..retransmit_count + 1 {
-        socket.send_chunk(kind_data)?;
+// pub fn transmit_and_wait<C: ChunkHeader, T, P: FnMut(Chunk, SocketAddr) ->
+// Option<T>>(     socket: &ChunkSocket,
+//     kind_data: &C,
+//     retransmit_timeout: std::time::Duration,
+//     retransmit_count: usize,
+//     r: &[&ChunkReceiver],
+//     mut p: P,
+// ) -> Result<T, TransmitAndWaitError> {
+//     for _ in 0..retransmit_count + 1 {
+//         socket.send_chunk(kind_data)?;
 
-        match wait_for_chunk2(r, retransmit_timeout, &mut p) {
-            Ok(v) => return Ok(v),
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(TransmitAndWaitError::RecvError(
-                    RecvTimeoutError::Disconnected,
-                ))
-            }
-        }
-    }
+//         match wait_for_chunk2(r, retransmit_timeout, &mut p) {
+//             Ok(v) => return Ok(v),
+//             Err(RecvTimeoutError::Timeout) => continue,
+//             Err(RecvTimeoutError::Disconnected) => {
+//                 return Err(TransmitAndWaitError::RecvError(
+//                     RecvTimeoutError::Disconnected,
+//                 ))
+//             }
+//         }
+//     }
 
-    Err(TransmitAndWaitError::RecvError(RecvTimeoutError::Timeout))
-}
+//     Err(TransmitAndWaitError::RecvError(RecvTimeoutError::Timeout))
+// }
 
-pub fn transmit_to_and_wait<T: ChunkHeader, P: FnMut(Chunk, SocketAddr) -> bool>(
-    socket: &ChunkSocket,
-    addr: &SocketAddr,
-    kind_data: &T,
-    retransmit_timeout: std::time::Duration,
-    retransmit_count: usize,
-    r: &ChunkReceiver,
-    mut p: P,
-) -> Result<(), TransmitAndWaitError> {
-    for _ in 0..retransmit_count + 1 {
-        socket.send_chunk_to(kind_data, &(*addr).into())?;
+// pub fn transmit_to_and_wait<T: ChunkHeader, P: FnMut(Chunk, SocketAddr) ->
+// bool>(     socket: &ChunkSocket,
+//     addr: &SocketAddr,
+//     kind_data: &T,
+//     retransmit_timeout: std::time::Duration,
+//     retransmit_count: usize,
+//     r: &ChunkReceiver,
+//     mut p: P,
+// ) -> Result<(), TransmitAndWaitError> {
+//     for _ in 0..retransmit_count + 1 {
+//         socket.send_chunk_to(kind_data, &(*addr).into())?;
 
-        match wait_for_chunk(r, retransmit_timeout, &mut p) {
-            Ok(_) => return Ok(()),
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(TransmitAndWaitError::RecvError(
-                    RecvTimeoutError::Disconnected,
-                ))
-            }
-        }
-    }
+//         match wait_for_chunk(r, retransmit_timeout, &mut p) {
+//             Ok(_) => return Ok(()),
+//             Err(RecvTimeoutError::Timeout) => continue,
+//             Err(RecvTimeoutError::Disconnected) => {
+//                 return Err(TransmitAndWaitError::RecvError(
+//                     RecvTimeoutError::Disconnected,
+//                 ))
+//             }
+//         }
+//     }
 
-    Err(TransmitAndWaitError::RecvError(RecvTimeoutError::Timeout))
-}
+//     Err(TransmitAndWaitError::RecvError(RecvTimeoutError::Timeout))
+// }

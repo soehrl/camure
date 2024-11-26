@@ -61,7 +61,7 @@ impl BroadcastGroupSenderState {
 }
 
 impl GroupCoordinatorTypeImpl for BroadcastGroupSenderState {
-    const GROUP_TYPE: protocol::GroupType = protocol::GROUP_TYPE_BARRIER;
+    const GROUP_TYPE: protocol::GroupType = protocol::GROUP_TYPE_BROADCAST;
 
     fn process_join_cancelled(&mut self, addr: &SockAddr, _: &GroupCoordinatorState) {
         self.remove_addr(addr);
@@ -153,8 +153,8 @@ impl BroadcastGroupSender {
     pub(crate) fn new(group: GroupCoordinator<BroadcastGroupSenderState>) -> Self {
         Self {
             group,
-            initial_retransmit_delay: std::time::Duration::from_secs(1),
-            max_retransmit_delay: std::time::Duration::from_secs(10),
+            initial_retransmit_delay: std::time::Duration::from_millis(16),
+            max_retransmit_delay: std::time::Duration::from_secs(1),
             max_packets_in_flight: 10,
         }
     }
@@ -459,7 +459,7 @@ pub(crate) struct BroadcastGroupReceiverState {
 impl BroadcastGroupReceiverState {}
 
 impl GroupMemberTypeImpl for BroadcastGroupReceiverState {
-    const GROUP_TYPE: protocol::GroupType = protocol::GROUP_TYPE_BARRIER;
+    const GROUP_TYPE: protocol::GroupType = protocol::GROUP_TYPE_BROADCAST;
 
     fn process_group_join(&mut self, seq: SequenceNumber, _group: &GroupMemberState) {
         self.next_seq = seq;

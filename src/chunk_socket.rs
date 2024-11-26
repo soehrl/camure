@@ -75,16 +75,16 @@ impl ChunkSocket {
         Ok(ReceivedChunk::new(buffer, addr, size))
     }
 
-    #[inline]
-    pub fn send_chunk_buffer(
-        &self,
-        buffer: &ChunkBuffer,
-        packet_size: usize,
-    ) -> Result<(), std::io::Error> {
-        let sent_bytes = self.socket.send(&buffer[..packet_size])?;
-        debug_assert_eq!(sent_bytes, packet_size);
-        Ok(())
-    }
+    // #[inline]
+    // pub fn send_chunk_buffer(
+    //     &self,
+    //     buffer: &ChunkBuffer,
+    //     packet_size: usize,
+    // ) -> Result<(), std::io::Error> {
+    //     let sent_bytes = self.socket.send(&buffer[..packet_size])?;
+    //     debug_assert_eq!(sent_bytes, packet_size);
+    //     Ok(())
+    // }
 
     #[inline]
     pub fn send_chunk_buffer_to(
@@ -98,22 +98,22 @@ impl ChunkSocket {
         Ok(())
     }
 
-    pub fn send_chunk<T: ChunkHeader>(&self, kind_data: &T) -> Result<(), std::io::Error> {
-        let data_size = 1 + std::mem::size_of::<T>();
-        debug_assert!(data_size <= self.chunk_size);
+    // pub fn send_chunk<T: ChunkHeader>(&self, kind_data: &T) -> Result<(), std::io::Error> {
+    //     let data_size = 1 + std::mem::size_of::<T>();
+    //     debug_assert!(data_size <= self.chunk_size);
 
-        let kind_id = T::id();
-        let kind_id_buf = [kind_id];
-        let bufs = [
-            IoSlice::new(&kind_id_buf),
-            IoSlice::new(kind_data.as_bytes()),
-        ];
+    //     let kind_id = T::id();
+    //     let kind_id_buf = [kind_id];
+    //     let bufs = [
+    //         IoSlice::new(&kind_id_buf),
+    //         IoSlice::new(kind_data.as_bytes()),
+    //     ];
 
-        let sent_bytes = self.socket.send_vectored(&bufs)?;
-        debug_assert_eq!(sent_bytes, data_size);
+    //     let sent_bytes = self.socket.send_vectored(&bufs)?;
+    //     debug_assert_eq!(sent_bytes, data_size);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     pub fn send_chunk_to<T: ChunkHeader>(
         &self,
@@ -136,32 +136,32 @@ impl ChunkSocket {
         Ok(())
     }
 
-    pub fn send_chunk_with_payload<T: ChunkHeader>(
-        &self,
-        kind_data: &T,
-        payload: &[u8],
-    ) -> Result<(), std::io::Error> {
-        let data_size = 1 + std::mem::size_of::<T>() + payload.len();
-        if data_size > self.chunk_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "payload too large",
-            ));
-        }
+    // pub fn send_chunk_with_payload<T: ChunkHeader>(
+    //     &self,
+    //     kind_data: &T,
+    //     payload: &[u8],
+    // ) -> Result<(), std::io::Error> {
+    //     let data_size = 1 + std::mem::size_of::<T>() + payload.len();
+    //     if data_size > self.chunk_size {
+    //         return Err(std::io::Error::new(
+    //             std::io::ErrorKind::InvalidInput,
+    //             "payload too large",
+    //         ));
+    //     }
 
-        let kind_id = T::id();
-        let kind_id_buf = [kind_id];
-        let bufs = [
-            IoSlice::new(&kind_id_buf),
-            IoSlice::new(kind_data.as_bytes()),
-            IoSlice::new(payload),
-        ];
+    //     let kind_id = T::id();
+    //     let kind_id_buf = [kind_id];
+    //     let bufs = [
+    //         IoSlice::new(&kind_id_buf),
+    //         IoSlice::new(kind_data.as_bytes()),
+    //         IoSlice::new(payload),
+    //     ];
 
-        let sent_bytes = self.socket.send_vectored(&bufs)?;
-        debug_assert_eq!(sent_bytes, data_size);
+    //     let sent_bytes = self.socket.send_vectored(&bufs)?;
+    //     debug_assert_eq!(sent_bytes, data_size);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     pub fn send_chunk_with_payload_to<T: ChunkHeader>(
         &self,

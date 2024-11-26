@@ -152,20 +152,20 @@ impl ChunkBuffer {
         kind_data.write_to_prefix(&mut self.bytes[1..]);
     }
 
-    pub fn init_with_payload<T: ChunkHeader>(&mut self, kind_data: &T, payload: &[u8]) {
-        self.bytes[0] = T::id().into();
-        kind_data.write_to_prefix(&mut self.bytes[1..]);
-        let payload_offset = 1 + std::mem::size_of::<T>();
-        self.bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-    }
+    // pub fn init_with_payload<T: ChunkHeader>(&mut self, kind_data: &T, payload: &[u8]) {
+    //     self.bytes[0] = T::id().into();
+    //     kind_data.write_to_prefix(&mut self.bytes[1..]);
+    //     let payload_offset = 1 + std::mem::size_of::<T>();
+    //     self.bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+    // }
 
     fn kind_data_slice(&self, kind_size: usize) -> &[u8] {
         &self.bytes[1..1 + kind_size]
     }
 
-    fn payload_slice(&self, kind_size: usize, packet_size: usize) -> &[u8] {
-        &self.bytes[1 + kind_size..packet_size]
-    }
+    // fn payload_slice(&self, kind_size: usize, packet_size: usize) -> &[u8] {
+    //     &self.bytes[1 + kind_size..packet_size]
+    // }
 
     fn get_kind_data_ref<T: ChunkHeader>(
         &self,
@@ -182,20 +182,20 @@ impl ChunkBuffer {
         }
     }
 
-    fn get_kind_data_and_payload_ref<T: ChunkHeader>(
-        &self,
-        packet_size: usize,
-    ) -> Result<(&T, &[u8]), ChunkValidationError> {
-        let kind_data_size = std::mem::size_of::<T>();
+    // fn get_kind_data_and_payload_ref<T: ChunkHeader>(
+    //     &self,
+    //     packet_size: usize,
+    // ) -> Result<(&T, &[u8]), ChunkValidationError> {
+    //     let kind_data_size = std::mem::size_of::<T>();
 
-        match T::ref_from(self.kind_data_slice(kind_data_size)) {
-            Some(data) => Ok((data, self.payload_slice(kind_data_size, packet_size))),
-            None => Err(ChunkValidationError::InvalidPacketSize {
-                expected: 1 + kind_data_size,
-                actual: packet_size,
-            }),
-        }
-    }
+    //     match T::ref_from(self.kind_data_slice(kind_data_size)) {
+    //         Some(data) => Ok((data, self.payload_slice(kind_data_size, packet_size))),
+    //         None => Err(ChunkValidationError::InvalidPacketSize {
+    //             expected: 1 + kind_data_size,
+    //             actual: packet_size,
+    //         }),
+    //     }
+    // }
 
     pub fn validate(&self, packet_size: usize) -> Result<Chunk, ChunkValidationError> {
         match self.bytes[0] {
@@ -267,17 +267,17 @@ impl ChunkBufferAllocator {
         self.chunk_size
     }
 
-    pub fn with_initial_capacity(chunk_size: usize, capacity: usize) -> Self {
-        let allocator = Self::new(chunk_size);
-        for _ in 0..capacity {
-            match allocator.sender.send(allocator.allocate_bytes()) {
-                Ok(_) => (),
-                Err(_) => unreachable!(), /* This cannot happen, as we on both, the sender and
-                                           * receiver. */
-            }
-        }
-        allocator
-    }
+    // pub fn with_initial_capacity(chunk_size: usize, capacity: usize) -> Self {
+    //     let allocator = Self::new(chunk_size);
+    //     for _ in 0..capacity {
+    //         match allocator.sender.send(allocator.allocate_bytes()) {
+    //             Ok(_) => (),
+    //             Err(_) => unreachable!(), /* This cannot happen, as we on both, the sender and
+    //                                        * receiver. */
+    //         }
+    //     }
+    //     allocator
+    // }
 
     fn allocate_bytes(&self) -> Box<[u8]> {
         vec![0; self.chunk_size].into_boxed_slice()
