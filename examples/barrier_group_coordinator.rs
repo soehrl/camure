@@ -1,9 +1,6 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Instant,
-};
+use std::{net::SocketAddr, time::Instant};
 
-use multicast::session::{Coordinator, GroupId};
+use camure::session::{Coordinator, GroupId};
 
 fn main() {
     use tracing_subscriber::layer::SubscriberExt;

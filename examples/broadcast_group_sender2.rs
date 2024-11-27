@@ -1,10 +1,6 @@
-use std::{
-    io::Write,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Instant,
-};
+use std::{io::Write, net::SocketAddr};
 
-use multicast::session::{Coordinator, GroupId};
+use camure::session::{Coordinator, GroupId};
 
 const LOREM_IPSUM: &[u8; 5992] = br"
 Lorem ipsum dolor sit amet, consectetur adipiscing elit. Nullam posuere hendrerit sem, id malesuada nisl pulvinar et. Maecenas venenatis nisl at nibh faucibus, vitae tempor magna auctor. Vestibulum interdum mi diam, vel molestie justo condimentum eu. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Nam odio sem, gravida sed dignissim a, tempor dignissim magna. Duis a lacus a magna gravida fermentum sit amet vitae justo. Pellentesque gravida lacus eget ante ultrices dapibus. Curabitur et iaculis felis. Etiam mollis diam a est fermentum, id vestibulum arcu rutrum. Aenean lobortis fermentum dolor, a consectetur dui ultrices vitae. Suspendisse id ultrices diam. Praesent eget varius lorem. Sed dignissim, libero vel rhoncus cursus, nulla massa bibendum nulla, nec fermentum nisi risus bibendum magna. Integer quis mauris in odio vulputate dictum ut id lacus.
