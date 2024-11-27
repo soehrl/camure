@@ -5,7 +5,7 @@ use camure::session::{Coordinator, GroupId};
 fn main() {
     use tracing_subscriber::layer::SubscriberExt;
     let subscriber =
-        tracing_subscriber::Registry::default().with(tracing_tape::TapeRecorder::default());
+        tracing_subscriber::Registry::default().with(tracing_subscriber::fmt::Layer::default());
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let mut args = std::env::args();
@@ -16,7 +16,6 @@ fn main() {
 
     let coordinator = Coordinator::start_session(bind_addr, multicast_addr).unwrap();
 
-    let vrm = coordinator.create_barrier_group(Some(0)).unwrap();
     let mut barrier_group_coordinator = coordinator.create_barrier_group(group_id).unwrap();
     barrier_group_coordinator.accept().unwrap();
 
