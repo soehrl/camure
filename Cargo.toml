@@ -9,7 +9,7 @@ homepage = "https://github.com/soehrl/camure"
 repository = "https://github.com/soehrl/camure"
 license = "MIT/Apache-2.0"
 keywords = ["reliable", "multicast", "broadcast", "synchronization", "udp"]
-categories = ["network-programming", "concurrency", "synchronization"]
+categories = ["network-programming", "concurrency"]
 
 [dependencies]
 ahash = "0.8.11"
