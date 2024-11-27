@@ -1,7 +1,15 @@
 [package]
 name = "camure"
 version = "0.1.0"
+authors = ["Simon Oehrl"]
 edition = "2021"
+description = "High-performance 1-to-many communication and synchronization primitives using UDP multicast."
+readme = "README.md"
+homepage = "https://github.com/soehrl/camure"
+repository = "https://github.com/soehrl/camure"
+license = "MIT/Apache-2.0"
+keywords = ["reliable", "multicast", "broadcast", "synchronization", "udp"]
+categories = ["network-programming", "concurrency", "synchronization"]
 
 [dependencies]
 ahash = "0.8.11"
