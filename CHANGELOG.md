@@ -8,4 +8,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- This CHANGELOG file that will contain all notable changes to this project
+- This CHANGELOG file that will contain all notable changes to this project ([#1](https://github.com/soehrl/camure/pull/1))
