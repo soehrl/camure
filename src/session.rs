@@ -311,7 +311,7 @@ impl Coordinator {
                 .ok_or(GroupCreateError::GroupIdInUse(channel_id))?
         } else {
             let mut channel = None;
-            for channel_id in 1..=GroupId::MAX {
+            for channel_id in 0..=GroupId::MAX {
                 if let Some(c) = self
                     .socket
                     .allocate_channel(channel_id.into(), receive_capacity)
