@@ -9,3 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - This CHANGELOG file that will contain all notable changes to this project ([#1](https://github.com/soehrl/camure/pull/1))
+
+### Fixed
+- Automatically assigned group IDs start now at 0 ([#2](https://github.com/soehrl/camure/pull/2))
