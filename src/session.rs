@@ -1,3 +1,5 @@
+//! Session management
+
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
@@ -197,6 +199,11 @@ impl Coordinator {
     ///
     /// See [`Self::start_session_with_config`] for additional configuration
     /// options.
+    ///
+    /// <div class="warning">
+    /// This library currently does not support <a href="https://en.wikipedia.org/wiki/Loopback_address">loopback interfaces</a> such as 127.0.0.1, please use the
+    /// actual network interface instead.
+    /// </div>
     pub fn start_session(
         bind_address: SocketAddr,
         multicast_address: SocketAddr,
@@ -214,6 +221,11 @@ impl Coordinator {
     /// See [`MulticastServerConfig`] for the available configuration options
     /// and [`Self::start_session`] for more information regarding the address
     /// parameters.
+    ///
+    /// <div class="warning">
+    /// This library currently does not support <a href="https://en.wikipedia.org/wiki/Loopback_address">loopback interfaces</a> such as 127.0.0.1, please use the
+    /// actual network interface instead.
+    /// </div>
     pub fn start_session_with_config(
         bind_address: SocketAddr,
         multicast_address: SocketAddr,
@@ -332,24 +344,38 @@ impl Coordinator {
         })
     }
 
+    /// Creates a new barrier group.
+    ///
+    /// The `desired_group_id` parameter can be used to request a specific group
+    /// ID. If the ID is already in use, an error is returned. If `None` is
+    /// passed, the coordinator will assign an ID.
+    ///
+    /// See [barrier](crate::barrier) for more information.
     pub fn create_barrier_group(
         &self,
-        desired_channel_id: Option<GroupId>,
+        desired_group_id: Option<GroupId>,
     ) -> Result<BarrierGroupCoordinator, GroupCreateError> {
         let group = self.create_group(
-            desired_channel_id,
+            desired_group_id,
             Some(1024.try_into().unwrap()),
             BarrierGroupCoordinatorState::default(),
         )?;
         Ok(BarrierGroupCoordinator { group })
     }
 
+    /// Creates a new broadcast group.
+    ///
+    /// The `desired_group_id` parameter can be used to request a specific group
+    /// ID. If the ID is already in use, an error is returned. If `None` is
+    /// passed, the coordinator will assign an ID.
+    ///
+    /// See [broadcast](crate::broadcast) for more information.
     pub fn create_broadcast_group(
         &self,
-        desired_channel_id: Option<GroupId>,
+        desired_group_id: Option<GroupId>,
     ) -> Result<BroadcastGroupSender, GroupCreateError> {
         let group = self.create_group(
-            desired_channel_id,
+            desired_group_id,
             Some(1024.try_into().unwrap()),
             BroadcastGroupSenderState::default(),
         )?;
@@ -447,6 +473,11 @@ impl Member {
     ///
     /// The `addr` parameter corresponds to the `bind_addr` parameter of
     /// [`Coordinator::start_session`].
+    ///
+    /// <div class="warning">
+    /// This library currently does not support <a href="https://en.wikipedia.org/wiki/Loopback_address">loopback interfaces</a> such as 127.0.0.1, please use the
+    /// actual network interface instead.
+    /// </div>
     pub fn join_session(addr: SocketAddr) -> Result<Self, JoinSessionError> {
         let join_session_span = tracing::trace_span!("join_session", addr = %addr);
         let _join_session_span_guard = join_session_span.enter();
@@ -516,7 +547,9 @@ impl Member {
             move |socket, reason| match reason {
                 CallbackReason::Timeout => {
                     // We ran into a timeout, which is set to the heartbeat interval
-                    if let Err(err) = socket.send_chunk_to(&SessionHeartbeat, &coordinator_address_copy) {
+                    if let Err(err) =
+                        socket.send_chunk_to(&SessionHeartbeat, &coordinator_address_copy)
+                    {
                         tracing::error!(%err, "failed to send heartbeat");
                         todo!("handle error");
                     } else {
@@ -560,6 +593,10 @@ impl Member {
         .map_err(JoinGroupError::IoError)
     }
 
+    /// Joins a barrier group.
+    ///
+    /// The barrier group with the specified if must have been previously
+    /// created by the coordinator.
     pub fn join_barrier_group(
         &self,
         channel_id: GroupId,
@@ -568,6 +605,10 @@ impl Member {
         Ok(BarrierGroupMember { group })
     }
 
+    /// Joins a broadcast group.
+    ///
+    /// The broadcast group with the specified if must have been previously
+    /// created by the coordinator.
     pub fn join_broadcast_group(
         &self,
         channel_id: GroupId,

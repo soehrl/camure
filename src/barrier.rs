@@ -1,3 +1,10 @@
+//! Barrier groups a used to synchronize all members of a group.
+//!
+//! The coordinator will create a barrier group using
+//! [`Coordinator::create_barrier_group`](crate::session::Coordinator::create_barrier_group) and
+//! members are able to join the group using
+//! [`Member::join_barrier_group`](crate::session::Member::join_barrier_group).
+
 use std::net::SocketAddr;
 
 use ahash::HashSet;
@@ -132,6 +139,7 @@ impl GroupCoordinatorTypeImpl for BarrierGroupCoordinatorState {
     fn process_join_request(&mut self, _addr: &SockAddr, _group: &GroupCoordinatorState) {}
 }
 
+/// Manages a barrier group.
 pub struct BarrierGroupCoordinator {
     pub(crate) group: GroupCoordinator<BarrierGroupCoordinatorState>,
     // pub(crate) state: BarrierGroupCoordinatorState,
@@ -154,15 +162,23 @@ impl BarrierGroupCoordinator {
         self.group.state.members.len() == self.group.inner.arrived.len()
     }
 
+    /// Returns true if the group has members and false otherwise.
     pub fn has_members(&self) -> bool {
         !self.group.state.members.is_empty()
     }
 
+    /// Accepts a new member into the group.
+    ///
+    /// This function will block until a new member has joined the group.
     #[tracing::instrument(skip(self))]
     pub fn accept(&mut self) -> std::io::Result<SocketAddr> {
         self.group.accept().and_then(sock_addr_to_socket_addr)
     }
 
+    /// Tries to accept a new member into the group.
+    ///
+    /// This function will return `Ok(None)` if no new member has joined the
+    /// group. This function does not block.
     #[tracing::instrument(skip(self))]
     pub fn try_accept(&mut self) -> std::io::Result<Option<SocketAddr>> {
         let addr = self.group.try_accept()?;
@@ -223,6 +239,7 @@ impl BarrierGroupCoordinator {
         unreachable!();
     }
 
+    /// Waits until all members have arrived at the barrier.
     #[tracing::instrument(skip(self))]
     pub fn wait(&mut self) -> std::io::Result<()> {
         if self.group.state.members.is_empty() {
@@ -367,6 +384,9 @@ impl GroupMemberTypeImpl for BarrierGroupMemberState {
     }
 }
 
+/// Represents a member of a barrier group.
+///
+/// Dropping this object will leave the barrier group.
 pub struct BarrierGroupMember {
     pub(crate) group: GroupMember<BarrierGroupMemberState>,
 }
@@ -398,6 +418,7 @@ impl BarrierGroupMember {
         unreachable!();
     }
 
+    /// Waits until all members have arrived at the barrier.
     #[tracing::instrument(skip(self))]
     pub fn wait(&mut self) -> std::io::Result<()> {
         let reached = self.send_reached()?;

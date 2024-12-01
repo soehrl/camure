@@ -17,25 +17,14 @@
 //! each other. Groups are always created by the coordinator and must be
 //! explicitly joined by members. There are currently two different types of
 //! groups.
+//! - [Barrier](barrier): Synchronizes all members of a group.
+//! - [Broadcast](broadcast): Broadcasts a message to all members of a group.
 //!
-//! ## Barrier
-//!
-//! ## Broadcast
-//!
-//! # Debugging
-//! If you encounter a lot of timeouts, hangs, or other issues, you can enable
-//! logging to get more information about what is happening. This crate uses the
-//! [log](https://crates.io/crates/log) crate for logging. So, choose a
-//! logging implementation according to their
-//! [documentation](https://docs.rs/log/latest/log/) and make sure to set the
-//! log level to `trace` for this crate. In order to avoid any overhead caused
-//! by logging ensure that the compile time filter is set to debug or higher
-//! (see [Compile Time Filters](https://docs.rs/log/latest/log/#compile-time-filters) for more
-//! information).
-//!
-//! # Future Work
-//! - **Improve Member Management**: Currrently, the chunk allocation strategy
-//!   is suboptimal and can be improved to increase performance.
+//! # Important Notes
+//! <div class="warning">
+//! This library currently does not support <a href="https://en.wikipedia.org/wiki/Loopback_address">loopback interfaces</a> such as 127.0.0.1, please use the
+//! actual network interface instead.
+//! </div>
 
 pub(crate) mod chunk;
 pub(crate) mod chunk_socket;
