@@ -4,6 +4,46 @@
 //! members. The coordinator can create broadcast groups using
 //! [`Coordinator::create_broadcast_group`](crate::session::Coordinator::create_broadcast_group) and members can join broadcast groups using
 //! [`Member::join_broadcast_group`](crate::session::Member::join_broadcast_group).
+//!
+//! # Example
+//! #### Coordinator
+//! ```no_run
+//! use camure::session::Coordinator;
+//! use std::io::Write;
+//!
+//! let bind_addr = "192.168.0.100:12345".parse()?;
+//! let multicast_addr = "234.0.0.0:55555".parse()?;
+//! let coordinator = Coordinator::start_session(bind_addr, multicast_addr)?;
+//! 
+//! let mut sender = coordinator.create_broadcast_group(Some(0))?;
+//! sender.accept().unwrap();
+//!
+//! for _ in 0..1000 {
+//!     sender.write_message().write_all(b"SOME DATA")?;
+//! }
+//! sender.wait()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! #### Member
+//! ```no_run
+//! use camure::session::Member;
+//! use std::io::Read;
+//!
+//! let coordinator_addr = "192.168.0.100:12345".parse()?;
+//! let member = Member::join_session(coordinator_addr)?;
+//!
+//! let mut receiver = member.join_broadcast_group(0).unwrap();
+//!
+//! for _ in 0..1000 {
+//!     let mut buf = String::new();
+//!     let message = receiver.recv()?;
+//!     let mut message_reader = message.read();
+//!     message_reader.read_to_string(&mut buf)?;
+//!     println!("{}", buf);
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::{
     collections::VecDeque,
