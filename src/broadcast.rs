@@ -1,3 +1,10 @@
+//! Broadcast groups allow reliable 1-to-many communication.
+//!
+//! Broadcast groups allow the coordinator to reliably send messages to all
+//! members. The coordinator can create broadcast groups using
+//! [`Coordinator::create_broadcast_group`](crate::session::Coordinator::create_broadcast_group) and members can join broadcast groups using
+//! [`Member::join_broadcast_group`](crate::session::Member::join_broadcast_group).
+
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -142,6 +149,7 @@ impl GroupCoordinatorTypeImpl for BroadcastGroupSenderState {
     }
 }
 
+/// A sender for broadcast messages.
 pub struct BroadcastGroupSender {
     pub(crate) group: GroupCoordinator<BroadcastGroupSenderState>,
     pub(crate) initial_retransmit_delay: std::time::Duration,
@@ -225,10 +233,12 @@ impl BroadcastGroupSender {
         Ok(())
     }
 
+    /// Returns the group id.
     pub fn id(&self) -> GroupId {
         self.group.id().into()
     }
 
+    /// Returns true if the group has members.
     pub fn has_members(&self) -> bool {
         !self.group.state.members.is_empty()
     }
@@ -255,12 +265,20 @@ impl BroadcastGroupSender {
         self.process_unacknlowedged_chunks()
     }
 
+    /// Accepts a new connection.
+    ///
+    /// This method blocks until a new connection is established or an error
+    /// occurs.
     #[tracing::instrument(skip(self))]
     pub fn accept(&mut self) -> std::io::Result<SocketAddr> {
         self.process()?;
         self.group.accept().and_then(sock_addr_to_socket_addr)
     }
 
+    /// Tries to accept a new connection.
+    ///
+    /// This method does not block and returns `Ok(None)` if no new connection
+    /// is available.
     #[tracing::instrument(skip(self))]
     pub fn try_accept(&mut self) -> std::io::Result<Option<SocketAddr>> {
         self.process_unacknlowedged_chunks()?;
@@ -337,6 +355,7 @@ impl BroadcastGroupSender {
         Ok(())
     }
 
+    /// Start writing a new message to be broadcasted.
     pub fn write_message(&mut self) -> MessageWriter {
         MessageWriter {
             buffer: ManuallyDrop::new(self.group.buffer_allocator().allocate()),
@@ -346,6 +365,7 @@ impl BroadcastGroupSender {
         }
     }
 
+    /// Waits until all messages have been received by all members.
     pub fn wait(&mut self) -> Result<(), std::io::Error> {
         while self.group.inner.packets_in_flight > 0 {
             self.process()?;
@@ -354,6 +374,12 @@ impl BroadcastGroupSender {
     }
 }
 
+/// A writer for a broadcast message.
+///
+/// This struct implements the [`Write`](std::io::Write) trait and can be used
+/// to write a message. The final chunk of the message is sent when the writer
+/// is dropped. If the message is split across multiple chunks, intermediate
+/// chunks are sent as soon as they are complete.
 pub struct MessageWriter<'a> {
     sender: &'a mut BroadcastGroupSender,
     buffer: ManuallyDrop<ChunkBuffer>,
@@ -405,11 +431,19 @@ impl Write for MessageWriter<'_> {
     }
 }
 
+/// Represents a received message.
+///
+/// Use the [`read`](Message::read) method to read the message.
 pub struct Message {
     chunks: Vec<ReceivedChunk>,
 }
 
 impl Message {
+    /// Reads the message.
+    ///
+    /// This method returns a [`MessageReader`](MessageReader) that implements
+    /// the [`Read`](std::io::Read) trait and can be used to read the
+    /// message.
     pub fn read(&self) -> MessageReader {
         MessageReader {
             chunks: &self.chunks,
@@ -418,6 +452,10 @@ impl Message {
     }
 }
 
+/// A reader for a received message.
+///
+/// This struct implements the [`Read`](std::io::Read) trait and can be used to
+/// read the message.
 pub struct MessageReader<'a> {
     chunks: &'a [ReceivedChunk],
     cursor: usize,
@@ -548,11 +586,15 @@ impl GroupMemberTypeImpl for BroadcastGroupReceiverState {
     }
 }
 
+/// A receiver for broadcast messages.
 pub struct BroadcastGroupReceiver {
     pub(crate) group: GroupMember<BroadcastGroupReceiverState>,
 }
 
 impl BroadcastGroupReceiver {
+    /// Receives a message from the sender.
+    ///
+    /// This method blocks until a message is received.
     pub fn recv(&mut self) -> std::io::Result<Message> {
         loop {
             let chunks = &mut self.group.inner_mut()?.chunks;
