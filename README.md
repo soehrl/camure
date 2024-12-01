@@ -17,6 +17,9 @@ If you want to use the library from languages other than Rust, please take a loo
 Below are a few examples that will get you started quickly.
 The full documentation can be found [here](https://docs.rs/camure/).
 
+> [!IMPORTANT] 
+> This library currently does not support [loopback interfaces](https://en.wikipedia.org/wiki/Loopback_address) such as 127.0.0.1, please use the actual network interface instead.
+
 ### Barrier Groups
 #### Coordinator
 ```rust
