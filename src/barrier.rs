@@ -4,6 +4,38 @@
 //! [`Coordinator::create_barrier_group`](crate::session::Coordinator::create_barrier_group) and
 //! members are able to join the group using
 //! [`Member::join_barrier_group`](crate::session::Member::join_barrier_group).
+//!
+//! # Example
+//! #### Coordinator
+//! ```no_run
+//! use camure::session::Coordinator;
+//!
+//! let bind_addr = "192.168.0.100:12345".parse()?;
+//! let multicast_addr = "234.0.0.0:55555".parse()?;
+//! let coordinator = Coordinator::start_session(bind_addr, multicast_addr)?;
+//! 
+//! let mut barrier_group_coordinator = coordinator.create_barrier_group(Some(0))?;
+//! barrier_group_coordinator.accept()?;
+//! 
+//! for _ in 0..1000 {
+//!     barrier_group_coordinator.wait()?;
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! #### Member
+//! ```no_run
+//! use camure::session::Member;
+//!
+//! let coordinator_addr = "192.168.0.100:12345".parse()?;
+//! let member = Member::join_session(coordinator_addr)?;
+//!
+//! let mut barrier_group_member = member.join_barrier_group(0)?;
+//! for _ in 0..1000 {
+//!     barrier_group_member.wait()?;
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::net::SocketAddr;
 
